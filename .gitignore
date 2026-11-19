@@ -1,0 +1,12 @@
+# Build output
+Analyzer/UpdateHealthAnalyzer.exe
+*.pdb
+
+# Analyzer runtime data
+Analyzer/cache/
+cache/
+UpdateHealthReports/
+
+# Collector bundles (contain device data)
+UpdateHealth_*/
+UpdateHealth_*.zip
