@@ -17,7 +17,19 @@ UpdateHealthKit\
   Analyzer\UpdateHealthAnalyzer.exe     created by the build
 ```
 
-## 1. Build and sign (once, on your admin PC)
+## Download
+
+A ready-built zip containing `UpdateHealthAnalyzer.exe`, the collector, the build script and this README is on the [Latest build release](../../releases/tag/latest). GitHub Actions rebuilds it on every push to `main`. That build is **unsigned**, so sign it before using it under AppLocker:
+
+```powershell
+# in the extracted folder (right-click the zip > Properties > Unblock first)
+Set-ExecutionPolicy -Scope Process Bypass
+.\Build\Build-UpdateHealthKit.ps1 -SignOnly        # or -SignOnly -Thumbprint <thumb>
+```
+
+Pushing a tag such as `v1.0.0` also creates a versioned release.
+
+## 1. Build and sign yourself (optional)
 
 ```powershell
 cd UpdateHealthKit\Build
