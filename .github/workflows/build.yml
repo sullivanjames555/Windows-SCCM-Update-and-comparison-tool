@@ -1,0 +1,65 @@
+name: Build UpdateHealthKit
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile analyzer (built-in .NET Framework csc.exe)
+        shell: powershell
+        run: .\Build\Build-UpdateHealthKit.ps1 -SkipSign
+
+      - name: Smoke test
+        shell: powershell
+        run: |
+          & .\Analyzer\UpdateHealthAnalyzer.exe -help
+          if ($LASTEXITCODE -ne 2) { throw "Unexpected exit code $LASTEXITCODE from -help" }
+          $global:LASTEXITCODE = 0
+
+      - name: Package
+        shell: powershell
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'UpdateHealthKit'
+          New-Item -ItemType Directory -Path "$stage\Analyzer", "$stage\Collector", "$stage\Build" -Force | Out-Null
+          Copy-Item .\Analyzer\UpdateHealthAnalyzer.exe "$stage\Analyzer\"
+          Copy-Item .\Collector\Invoke-UpdateHealthCollector.ps1 "$stage\Collector\"
+          Copy-Item .\Build\Build-UpdateHealthKit.ps1 "$stage\Build\"
+          Copy-Item .\README.md "$stage\"
+          Compress-Archive -Path "$stage\*" -DestinationPath .\UpdateHealthKit.zip -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UpdateHealthKit
+          path: UpdateHealthKit.zip
+
+      - name: Publish rolling "latest" release (main branch)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes 2>$null
+          $notes = "Unsigned build of commit $env:GITHUB_SHA. Sign it before use under AppLocker: .\Build\Build-UpdateHealthKit.ps1 -SignOnly"
+          gh release create latest .\UpdateHealthKit.zip --target $env:GITHUB_SHA --title "Latest build" --notes $notes --prerelease
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+
+      - name: Publish versioned release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME .\UpdateHealthKit.zip --title "UpdateHealthKit $env:GITHUB_REF_NAME" --notes "Unsigned build. Sign it with .\Build\Build-UpdateHealthKit.ps1 -SignOnly before use under AppLocker."
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

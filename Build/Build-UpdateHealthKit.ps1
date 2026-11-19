@@ -18,11 +18,16 @@
     validating when the certificate expires).
 .PARAMETER SkipSign
     Compile only.
+.PARAMETER SignOnly
+    Don't compile; just sign an existing Analyzer\UpdateHealthAnalyzer.exe and the collector
+    (use this on the unsigned build downloaded from the GitHub "latest" release).
 .PARAMETER CscPath
     Use a different csc.exe (e.g. Roslyn from Visual Studio Build Tools).
 
 .EXAMPLE
     .\Build-UpdateHealthKit.ps1
+.EXAMPLE
+    .\Build-UpdateHealthKit.ps1 -SignOnly
 .EXAMPLE
     .\Build-UpdateHealthKit.ps1 -Thumbprint 1A2B3C... -TimestampServer http://timestamp.sectigo.com
 #>
@@ -31,6 +36,7 @@ param(
     [string]$Thumbprint,
     [string]$TimestampServer = 'http://timestamp.digicert.com',
     [switch]$SkipSign,
+    [switch]$SignOnly,
     [string]$CscPath
 )
 
@@ -41,6 +47,11 @@ $outExe    = Join-Path $root 'Analyzer\UpdateHealthAnalyzer.exe'
 $collector = Join-Path $root 'Collector\Invoke-UpdateHealthCollector.ps1'
 
 # ---- Compile -------------------------------------------------------------------------------
+if ($SignOnly) {
+    if (-not (Test-Path -LiteralPath $outExe)) { throw "$outExe not found; nothing to sign." }
+    Write-Host 'Skipping compile (-SignOnly).'
+}
+else {
 $csc = $CscPath
 if (-not $csc) {
     $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -60,6 +71,7 @@ Write-Host "Compiling $($sources.Count) source files with $csc" -ForegroundColor
 & $csc @cscArgs
 if ($LASTEXITCODE -ne 0) { throw "Compilation failed (exit code $LASTEXITCODE). See the errors above." }
 Write-Host "Built $outExe" -ForegroundColor Green
+}
 
 if ($SkipSign) { Write-Host 'Skipping signing (-SkipSign).'; return }
 
@@ -78,7 +90,7 @@ else {
 if (-not $cert) { throw 'No valid code-signing certificate found. Pass -Thumbprint, or use -SkipSign to compile only.' }
 Write-Host ("Signing with {0} (thumbprint {1}, expires {2:yyyy-MM-dd})" -f $cert.Subject, $cert.Thumbprint, $cert.NotAfter) -ForegroundColor Cyan
 
-$toSign = @($outExe, $collector, $MyInvocation.MyCommand.Path)
+$toSign = @($outExe, $collector, $PSCommandPath)
 foreach ($file in $toSign) {
     $sig = $null
     try {
