@@ -16,17 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile analyzer (built-in .NET Framework csc.exe)
-        shell: powershell
-        run: .\Build\Build-UpdateHealthKit.ps1 -SkipSign
-
-      - name: Smoke test
-        shell: powershell
-        run: |
-          & .\Analyzer\UpdateHealthAnalyzer.exe -help
-          if ($LASTEXITCODE -ne 2) { throw "Unexpected exit code $LASTEXITCODE from -help" }
-          $global:LASTEXITCODE = 0
-
       - name: Parse-check PowerShell scripts
         shell: powershell
         run: |
@@ -39,69 +28,71 @@ jobs:
           if ($bad) { throw "$bad PowerShell parse error(s)" }
           Write-Host 'All PowerShell scripts parse cleanly.'
 
-      - name: End-to-end test (collector -> both analyzers)
+      - name: End-to-end test (collector -> analyzer -> results window)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $work = Join-Path $env:RUNNER_TEMP 'e2e'
-          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $bundles = Join-Path $work 'bundles'
+          New-Item -ItemType Directory -Path $bundles -Force | Out-Null
 
-          # 1. Real collection on this runner (Windows Server, no SCCM client)
-          $bundle = Join-Path $work 'bundle-runner'
-          & .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath $bundle -Days 7 -NoZip
-          if (-not (Test-Path "$bundle\collection.json")) { throw 'Collector produced no collection.json' }
+          # 1. Real collection on this runner (Windows Server 2025, no SCCM client)
+          & .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath $bundles -Days 7 -NoZip
+          $real = Get-ChildItem $bundles -Directory | Where-Object { $_.Name -like "UpdateHealth_$($env:COMPUTERNAME)_*" } | Select-Object -First 1
+          if (-not $real -or -not (Test-Path "$($real.FullName)\collection.json")) { throw "Collector did not produce UpdateHealth_$($env:COMPUTERNAME)_<timestamp>\collection.json" }
+          Write-Host "Bundle folder name includes hostname: $($real.Name)"
+          $json = [IO.File]::ReadAllText("$($real.FullName)\collection.json")
 
-          # 2. Same data edited to look like a Windows 11 24H2 Enterprise client, to exercise the CU comparison
-          $sim = Join-Path $work 'bundle-client-sim'
-          New-Item -ItemType Directory -Path $sim -Force | Out-Null
-          $j = [IO.File]::ReadAllText("$bundle\collection.json")
-          $j = $j -replace '("InstallationType"\s*:\s*)"[^"]*"', '$1"Client"' `
-                  -replace '("EditionID"\s*:\s*)"[^"]*"', '$1"Enterprise"' `
-                  -replace '("CurrentBuild"\s*:\s*)\d+', '${1}26100' `
-                  -replace '("UBR"\s*:\s*)\d+', '${1}4000' `
-                  -replace '("DisplayVersion"\s*:\s*)(null|"[^"]*")', '$1"24H2"' `
-                  -replace '("ComputerName"\s*:\s*)"[^"]*"', '$1"CLIENTSIM01"'
-          [IO.File]::WriteAllText("$sim\collection.json", $j)
-
-          $script:failed = $false
-          function Test-Analysis([string]$Dir, [string]$Label) {
-            $files = @(Get-ChildItem $Dir -Recurse -Filter analysis.json)
-            if ($files.Count -ne 2) { Write-Host "::error::${Label}: expected 2 analysis.json files, found $($files.Count)"; $script:failed = $true; return }
-            foreach ($f in $files) {
-              $a = Get-Content $f.FullName -Raw | ConvertFrom-Json
-              foreach ($s in @($a.Findings | Where-Object { $_.Area -eq 'Analyzer' })) { Write-Host "::error::$Label $($a.ComputerName): $($s.Title) - $($s.Detail)"; $script:failed = $true }
-              $md = $a.MicrosoftData
-              if ($md.WindowsVersions -lt 1 -or $md.WindowsReleaseBuilds -lt 1 -or $md.DotNetChannels -lt 1) { Write-Host "::error::$Label Microsoft data not parsed: $($md | ConvertTo-Json -Compress)"; $script:failed = $true }
-              if ($a.ComputerName -eq 'CLIENTSIM01') {
-                $row = @($a.Updates | Where-Object { $_.Component -eq 'Windows 11 cumulative update' }) | Select-Object -First 1
-                if (-not $row -or $row.Status -eq 'Not checked') { Write-Host "::error::$Label client-sim: Windows 11 CU comparison did not run"; $script:failed = $true }
-                else { Write-Host "$Label client-sim CU row: $($row.Installed) -> $($row.Latest) [$($row.Status)]" }
-              }
-              Write-Host "$Label $($a.ComputerName): $($a.Summary | ConvertTo-Json -Compress) | MS data $($md | ConvertTo-Json -Compress)"
-              foreach ($u in $a.Updates) { Write-Host "   $($u.Severity) | $($u.Component) | $($u.Installed) -> $($u.Latest) | $($u.Status)" }
+          # 2. Simulated hosts built from the same data, to exercise other OS comparisons
+          function New-SimBundle([string]$Name, [hashtable]$Fields) {
+            $j = $json
+            foreach ($k in $Fields.Keys) {
+              $v = $Fields[$k]
+              if ($v -is [int]) { $j = $j -replace "(`"$k`"\s*:\s*)\d+", ('${1}' + $v) }
+              else { $j = $j -replace "(`"$k`"\s*:\s*)(null|`"[^`"]*`")", ('${1}"' + $v + '"') }
             }
+            $dir = Join-Path $bundles "UpdateHealth_${Name}_20990101-000000"
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [IO.File]::WriteAllText("$dir\collection.json", $j)
           }
+          New-SimBundle 'CLIENTSIM01' @{ ComputerName = 'CLIENTSIM01'; InstallationType = 'Client'; EditionID = 'Enterprise'; CurrentBuild = 26100; UBR = 4000; DisplayVersion = '24H2'; OSCaption = 'Microsoft Windows 11 Enterprise' }
+          New-SimBundle 'SRV2016SIM' @{ ComputerName = 'SRV2016SIM'; InstallationType = 'Server'; EditionID = 'ServerStandard'; CurrentBuild = 14393; UBR = 5000; DisplayVersion = '1607'; OSCaption = 'Microsoft Windows Server 2016 Standard' }
 
-          # 3. PowerShell analyzer: fail on any error record it writes
-          $psOut = Join-Path $work 'reports-powershell'
-          $log = & .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath $bundle, $sim -OutputPath $psOut 2>&1
-          $psExit = $LASTEXITCODE
+          # 3. Analyzer on the whole folder; fail on any error record; then the results window self-test
+          $out = Join-Path $work 'reports'
+          $log = & .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath $bundles -OutputPath $out -GuiTestSeconds 3 2>&1
+          $exit = $LASTEXITCODE
           $log | ForEach-Object { Write-Host $_ }
-          $psErrors = @($log | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-          foreach ($e in $psErrors) { Write-Host "::error::PowerShell analyzer: $($e.Exception.Message) $($e.InvocationInfo.PositionMessage)"; $script:failed = $true }
-          if ($psExit) { Write-Host "::error::PowerShell analyzer exit code $psExit"; $script:failed = $true }
-          Test-Analysis $psOut 'PowerShell'
+          $failed = $false
+          foreach ($e in @($log | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })) { Write-Host "::error::Analyzer: $($e.Exception.Message) $($e.InvocationInfo.PositionMessage)"; $failed = $true }
+          if ($exit) { Write-Host "::error::Analyzer exit code $exit"; $failed = $true }
+          if (-not ($log | Where-Object { "$_" -like 'Results window test: OK*' })) { Write-Host '::error::Results window self-test did not complete'; $failed = $true }
 
-          # 4. C# analyzer
-          $exeOut = Join-Path $work 'reports-exe'
-          $ErrorActionPreference = 'Continue'
-          & .\Analyzer\UpdateHealthAnalyzer.exe -Input $bundle -Input $sim -Output $exeOut
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::exe analyzer exit code $LASTEXITCODE"; $script:failed = $true }
-          Test-Analysis $exeOut 'exe'
-
-          Copy-Item $psOut, $exeOut -Destination (New-Item -ItemType Directory -Path .\e2e-reports -Force) -Recurse
+          $expect = @{
+            'CLIENTSIM01' = 'Windows 11 cumulative update'
+            'SRV2016SIM'  = 'Windows Server 2016 cumulative update'
+            $env:COMPUTERNAME = 'Windows Server 2025 cumulative update'
+          }
+          $files = @(Get-ChildItem $out -Recurse -Filter analysis.json)
+          if ($files.Count -ne 3) { Write-Host "::error::expected 3 analysis.json files, found $($files.Count)"; $failed = $true }
+          foreach ($f in $files) {
+            $a = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            foreach ($s in @($a.Findings | Where-Object { $_.Area -eq 'Analyzer' })) { Write-Host "::error::$($a.ComputerName): $($s.Title) - $($s.Detail)"; $failed = $true }
+            $md = $a.MicrosoftData
+            foreach ($k in 'WindowsVersions', 'WindowsReleaseBuilds', 'ServerVersions', 'ServerReleaseBuilds', 'DotNetChannels') {
+              if (-not ($md.$k -gt 0)) { Write-Host "::error::Microsoft data not parsed: $k = $($md.$k)"; $failed = $true }
+            }
+            $want = $expect[$a.ComputerName]
+            $row = @($a.Updates | Where-Object { $_.Component -eq $want }) | Select-Object -First 1
+            if (-not $row -or $row.Status -eq 'Not checked') { Write-Host "::error::$($a.ComputerName): '$want' comparison did not run"; $failed = $true }
+            Write-Host ""
+            Write-Host "== $($a.ComputerName): $($a.Summary | ConvertTo-Json -Compress)  MS data: $($md | ConvertTo-Json -Compress)"
+            foreach ($u in $a.Updates | Where-Object { $_.Component -notmatch '^(\.NET|ASP\.NET) (Runtime|SDK|Desktop|Core)' }) { Write-Host "   $($u.Severity) | $($u.Component) | $($u.Installed) -> $($u.Latest) | $($u.Status)" }
+          }
+          New-Item -ItemType Directory -Path .\e2e-reports -Force | Out-Null
+          Copy-Item "$out\*" .\e2e-reports -Recurse
           $global:LASTEXITCODE = 0
-          if ($script:failed) { throw 'End-to-end test failed (see errors above).' }
+          if ($failed) { throw 'End-to-end test failed (see errors above).' }
 
       - name: Upload sample reports from the end-to-end test
         if: always()
@@ -117,7 +108,6 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'UpdateHealthKit'
           New-Item -ItemType Directory -Path "$stage\Analyzer", "$stage\Collector", "$stage\Build" -Force | Out-Null
           Copy-Item .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 "$stage\Analyzer\"
-          Copy-Item .\Analyzer\UpdateHealthAnalyzer.exe "$stage\Analyzer\"
           Copy-Item .\Collector\Invoke-UpdateHealthCollector.ps1 "$stage\Collector\"
           Copy-Item .\Build\Build-UpdateHealthKit.ps1 "$stage\Build\"
           Copy-Item .\README.md "$stage\"
@@ -138,7 +128,7 @@ jobs:
           $ErrorActionPreference = 'Continue'
           gh release view latest *> $null
           if ($LASTEXITCODE -eq 0) { gh release delete latest --cleanup-tag --yes }
-          $notes = "Unsigned build of commit $env:GITHUB_SHA. Sign it before use under AppLocker: .\Build\Build-UpdateHealthKit.ps1 -SignOnly"
+          $notes = "Unsigned build of commit $env:GITHUB_SHA. Sign it before use under AppLocker: .\Build\Build-UpdateHealthKit.ps1"
           gh release create latest .\UpdateHealthKit.zip --target $env:GITHUB_SHA --title "Latest build" --notes $notes --prerelease
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
 
@@ -148,5 +138,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME .\UpdateHealthKit.zip --title "UpdateHealthKit $env:GITHUB_REF_NAME" --notes "Unsigned build. Sign it with .\Build\Build-UpdateHealthKit.ps1 -SignOnly before use under AppLocker."
+          gh release create $env:GITHUB_REF_NAME .\UpdateHealthKit.zip --title "UpdateHealthKit $env:GITHUB_REF_NAME" --notes "Unsigned build. Sign it with .\Build\Build-UpdateHealthKit.ps1 before use under AppLocker."
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

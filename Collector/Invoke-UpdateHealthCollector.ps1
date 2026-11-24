@@ -22,8 +22,10 @@
       - Connectivity tests to the MP and SUP (DNS / TCP / HTTP), skipped quickly when offline
 
 .PARAMETER OutputPath
-    Folder to write the bundle to. Default: a new folder next to this script (handy on a USB
-    stick), falling back to %TEMP% if that location is read-only.
+    Folder to put the bundle in (a local folder, USB drive or share). The bundle is always named
+    after this computer: <OutputPath>\UpdateHealth_<HOSTNAME>_<yyyyMMdd-HHmmss>\ plus a .zip of it,
+    so you can point several PCs at the same folder. Default: the folder this script is in
+    (handy on a USB stick), falling back to %TEMP% if that location is read-only.
 .PARAMETER Days
     Days of event logs, CCM logs and install history to collect. Default 30.
 .PARAMETER ScanCabPath
@@ -63,9 +65,11 @@
     online PC first and copy it alongside the kit.
 
 .EXAMPLE
-    .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath \\fileserver\it\UpdateHealth\PC123
+    .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath \\fileserver\it\UpdateHealth
 
-    Writes the bundle straight to a share the analyzer PC can read.
+    Writes \\fileserver\it\UpdateHealth\UpdateHealth_<HOSTNAME>_<timestamp>.zip. Run it on several PCs
+    with the same -OutputPath, then analyze them all at once:
+        .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath \\fileserver\it\UpdateHealth -SiteServer CM01
 
 .NOTES
     UpdateHealthKit 1.0.0. Requires Windows PowerShell 5.1. Read-only: it changes nothing on
@@ -304,11 +308,13 @@ function Get-FriendlyNetFramework {
 
 #region Output folder ---------------------------------------------------------------------
 
-if (-not $OutputPath) {
-    $base = $PSScriptRoot
-    if (-not $base) { $base = (Get-Location).Path }
-    $OutputPath = Join-Path $base ("UpdateHealth_{0}_{1}" -f $ComputerName, $Now.ToString('yyyyMMdd-HHmmss'))
-}
+# The bundle is always named after this host so bundles from many PCs can share one folder:
+#   <OutputPath or script folder>\UpdateHealth_<HOSTNAME>_<yyyyMMdd-HHmmss>\  (+ .zip)
+$BundleName = 'UpdateHealth_{0}_{1}' -f $ComputerName, $Now.ToString('yyyyMMdd-HHmmss')
+$base = $OutputPath
+if (-not $base) { $base = $PSScriptRoot }
+if (-not $base) { $base = (Get-Location).Path }
+$OutputPath = Join-Path $base $BundleName
 try {
     New-Item -ItemType Directory -Path $OutputPath -Force -ErrorAction Stop | Out-Null
     $probe = Join-Path $OutputPath '.write-test'
@@ -316,7 +322,7 @@ try {
     Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
 }
 catch {
-    $fallback = Join-Path $env:TEMP (Split-Path $OutputPath -Leaf)
+    $fallback = Join-Path $env:TEMP $BundleName
     Write-Warning "Cannot write to $OutputPath ($($_.Exception.Message)). Using $fallback instead."
     $OutputPath = $fallback
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null

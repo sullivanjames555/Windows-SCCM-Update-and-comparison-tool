@@ -57,7 +57,13 @@
     Re-download Microsoft data older than this many hours. Default 12.
 
 .PARAMETER Open
-    Open the report (or index.html for several PCs) when finished.
+    Open the HTML report (or index.html for several PCs) in the browser when finished.
+
+.PARAMETER NoGui
+    Don't show the results window. By default, when run interactively, a window pops up listing
+    every system analyzed: OS and build, how many monthly updates it is behind, the latest KB it
+    needs, .NET items to update and the problem counts. Select a system to see exactly what needs
+    updating and why it isn't updating; buttons open the full HTML report.
 
 .EXAMPLE
     .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\UpdateHealth_PC123_20261124-101500.zip -SiteServer CM01 -Open
@@ -99,7 +105,10 @@ param(
     [switch]$Offline,
     [string]$CacheDir,
     [ValidateRange(0, 8760)][int]$CacheHours = 12,
-    [switch]$Open
+    [switch]$Open,
+    [switch]$NoGui,
+    # Test hook used by CI: show the window, click through every system, close after N seconds.
+    [Parameter(DontShow = $true)][int]$GuiTestSeconds = 0
 )
 
 $ErrorActionPreference = 'Continue'
@@ -108,6 +117,8 @@ $AnalyzerVersion = '1.1.0'
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $Win11Url = 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information'
 $Win10Url = 'https://learn.microsoft.com/en-us/windows/release-health/release-information'
+$ServerUrls = @('https://learn.microsoft.com/en-us/windows/release-health/windows-server-release-info',
+                'https://learn.microsoft.com/en-us/windows-server/get-started/windows-server-release-info')
 $DotNetIndexUrls = @('https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json',
                      'https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json')
 
@@ -519,7 +530,7 @@ function ConvertTo-UpdateType([string]$raw) {
     return 'Unknown'
 }
 
-function Read-WindowsReleaseHtml([string]$Html) {
+function Read-WindowsReleaseHtml([string]$Html, [string]$Family) {
     if (-not $Html) { return }
     $opt = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
     $headings = @(foreach ($m in [regex]::Matches($Html, '<h2[^>]*>([\s\S]*?)</h2>', $opt)) { [pscustomobject]@{ Index = $m.Index; Text = (ConvertFrom-HtmlCell $m.Groups[1].Value) } })
@@ -570,12 +581,13 @@ function Read-WindowsReleaseHtml([string]$Html) {
                 $bm = [regex]::Match($lb, '(\d{5})\.(\d+)')
                 if (-not $bm.Success) { continue }
                 $channel = Get-Cell $row $iSvc
+                $verCell = $(if ($iVer -ge 0) { Get-Cell $row $iVer } else { Get-Cell $row 0 })
                 $script:WinVersions.Add([pscustomobject]@{
-                        Version = (Get-Cell $row $iVer); Channel = $channel; Availability = (Get-Cell $row $iAvail)
+                        Family = $Family; Version = $verCell; Channel = $channel; Availability = (Get-Cell $row $iAvail)
                         EosHomePro = (Get-Cell $row $iHome); EosEnterprise = (Get-Cell $row $iEnt)
                         LatestUpdate = (Get-Cell $row $iLatestUpd); LatestRevisionDate = (Get-Cell $row $iLatestRev)
                         Major = [int]$bm.Groups[1].Value; LatestUbr = [int]$bm.Groups[2].Value
-                        IsLtsc = ([string]$channel -match 'Long|LTSC')
+                        IsLtsc = ([string]$channel -match 'Long|LTSC|LTSB')
                     })
             }
             continue
@@ -598,13 +610,14 @@ function Read-WindowsReleaseHtml([string]$Html) {
             if (-not $km.Success) { continue }
             $major = [int]$bm.Groups[1].Value
             $ubrVal = [int]$bm.Groups[2].Value
-            if (-not $script:WinReleases.ContainsKey($major)) { $script:WinReleases[$major] = New-Object System.Collections.Generic.List[object] }
-            if (@($script:WinReleases[$major] | Where-Object { $_.Ubr -eq $ubrVal }).Count -gt 0) { continue }
+            $relKey = "$Family|$major"
+            if (-not $script:WinReleases.ContainsKey($relKey)) { $script:WinReleases[$relKey] = New-Object System.Collections.Generic.List[object] }
+            if (@($script:WinReleases[$relKey] | Where-Object { $_.Ubr -eq $ubrVal }).Count -gt 0) { continue }
             $rawType = Get-Cell $row $iType
             $dateText = Get-Cell $row $iDate
             $dv = $null; $tmp = [datetime]::MinValue
             if ([datetime]::TryParse([string]$dateText, $Inv, [System.Globalization.DateTimeStyles]::None, [ref]$tmp)) { $dv = $tmp }
-            $script:WinReleases[$major].Add([pscustomobject]@{
+            $script:WinReleases[$relKey].Add([pscustomobject]@{
                     Major = $major; Ubr = $ubrVal; Kb = 'KB' + $km.Groups[1].Value; Date = $dateText; DateValue = $dv
                     RawType = $rawType; Type = (ConvertTo-UpdateType $rawType); VersionName = $versionName; BuildText = "$major.$ubrVal"
                 })
@@ -612,25 +625,42 @@ function Read-WindowsReleaseHtml([string]$Html) {
     }
 }
 
-function Find-WinVersion([int]$Major, [bool]$Ltsc) {
-    $cands = @($script:WinVersions | Where-Object { $_.Major -eq $Major })
+function Find-WinVersion([string]$Family, [int]$Major, [bool]$Ltsc) {
+    $cands = @($script:WinVersions | Where-Object { $_.Family -eq $Family -and $_.Major -eq $Major })
     if ($cands.Count -eq 0) { return $null }
+    if ($Family -eq 'Server') { return ($cands | Sort-Object { [string]$_.Availability } | Select-Object -First 1) }
     $pick = @($cands | Where-Object { $_.IsLtsc -eq $Ltsc }) | Select-Object -First 1
     if ($pick) { return $pick }
     return $cands[0]
 }
 
-function Get-WinReleases([int]$Major) {
-    if (-not $script:WinReleases.ContainsKey($Major)) { return ,(New-Object System.Collections.Generic.List[object]) }
+function Get-WinReleases([string]$Family, [int]$Major) {
+    # Releases for this OS family and build, newest first. Windows 10 LTSB 2016 / LTSC 2019 share
+    # their monthly KBs with Server 2016 / 2019, so fall back to the other family's history.
+    $key = "$Family|$Major"
+    if (-not $script:WinReleases.ContainsKey($key)) {
+        $other = $(if ($Family -eq 'Server') { 'Client' } else { 'Server' })
+        $key = "$other|$Major"
+        if ($Major -eq 26100 -or -not $script:WinReleases.ContainsKey($key)) { return ,(New-Object System.Collections.Generic.List[object]) }
+    }
     $l = New-Object System.Collections.Generic.List[object]
-    foreach ($x in ($script:WinReleases[$Major] | Sort-Object Ubr -Descending)) { $l.Add($x) }
+    foreach ($x in ($script:WinReleases[$key] | Sort-Object Ubr -Descending)) { $l.Add($x) }
     return ,$l
 }
 
-function Get-NewestWinVersion([bool]$Windows11) {
-    return ($script:WinVersions | Where-Object { (($_.Major -ge 22000) -eq $Windows11) -and -not $_.IsLtsc } |
+function Get-NewestWinVersion([string]$Family, [bool]$Windows11) {
+    if ($Family -eq 'Server') {
+        return ($script:WinVersions | Where-Object { $_.Family -eq 'Server' -and $_.IsLtsc } |
+            Sort-Object { [string]$_.Availability } -Descending | Select-Object -First 1)
+    }
+    return ($script:WinVersions | Where-Object { $_.Family -eq 'Client' -and (($_.Major -ge 22000) -eq $Windows11) -and -not $_.IsLtsc } |
         Sort-Object { [string]$_.Availability } -Descending | Select-Object -First 1)
 }
+
+$ServerNames = @{ 14393 = 'Windows Server 2016'; 17763 = 'Windows Server 2019'; 20348 = 'Windows Server 2022'; 25398 = 'Windows Server, version 23H2'; 26100 = 'Windows Server 2025' }
+# How each Windows Server version's cumulative update is titled in the SCCM/WSUS catalog
+$ServerCuNames = @{ 14393 = 'Windows Server 2016'; 17763 = 'Windows Server 2019'; 20348 = 'Microsoft server operating system version 21H2'
+                    25398 = 'Microsoft server operating system version 23H2'; 26100 = 'Microsoft server operating system version 24H2' }
 
 $script:DotNetChannels = @{}
 
@@ -990,19 +1020,26 @@ function Invoke-AnalyzeMeta {
 function Invoke-AnalyzeWindows {
     $C = $script:C; $X = $script:Ctx
     $build = $X.Build; $ubr = $X.Ubr; $disp = $X.Disp; $edition = $X.Edition
-    $win11 = $build -ge 22000
-    $product = $(if ($win11) { 'Windows 11' } else { 'Windows 10' })
-    $ltsc = $edition -match 'Enterprise(S|SN)$'
-    $entClass = $edition -match 'Enterprise|Education|ServerRdsh'
-    $installedBuild = "$build.$ubr"
-    $instType = [string](js $C 'System.InstallationType')
-
-    if ($instType -match 'Server' -or $edition -match '^Server') {
-        Add-UpdateRow 'Windows Server cumulative update' $installedBuild 'not compared' 'Not checked' "Windows Server isn't covered by the Microsoft comparison; use the SCCM server view" 'Info'
-        Add-Note "This is Windows Server ($edition). The Microsoft client release comparison was skipped; SCCM, log and event checks still apply."
-        return
+    $isServer = $X.IsServer
+    $family = $(if ($isServer) { 'Server' } else { 'Client' })
+    $win11 = (-not $isServer -and $build -ge 22000)
+    if ($isServer) {
+        $product = $ServerNames[$build]
+        if (-not $product) { $product = [string](js $C 'System.OSCaption') -replace '^Microsoft\s+', '' }
+        if (-not $product) { $product = "Windows Server (build $build)" }
     }
-    if ($disp) { $script:R.CuPattern = "Cumulative Update for $product Version $disp for $($X.Arch)-based" }
+    else { $product = $(if ($win11) { 'Windows 11' } else { 'Windows 10' }) }
+    $ltsc = $edition -match 'Enterprise(S|SN)$'
+    $entClass = $isServer -or ($edition -match 'Enterprise|Education|ServerRdsh')
+    $installedBuild = "$build.$ubr"
+    $versionLabel = $(if ($isServer) { $product } elseif ($disp) { "$product $disp" } else { $product })
+
+    # SCCM catalog title for this OS's cumulative update, used by the SCCM server checks
+    if ($isServer) {
+        if ($ServerCuNames.ContainsKey($build)) { $script:R.CuPattern = "Cumulative Update for $($ServerCuNames[$build]) for $($X.Arch)-based" }
+    }
+    elseif ($disp) { $script:R.CuPattern = "Cumulative Update for $product Version $disp for $($X.Arch)-based" }
+
     if ($build -eq 0) { Add-Finding 'Info' 'Windows' 'OS build not present in the bundle' $null 'Check the collector transcript for System errors.'; return }
     if ($script:WinVersions.Count -eq 0 -and $script:WinReleases.Count -eq 0) {
         Add-UpdateRow "$product cumulative update" $installedBuild 'unknown' 'Not checked' 'Microsoft release data unavailable (offline and no cache).' 'Info'
@@ -1010,13 +1047,14 @@ function Invoke-AnalyzeWindows {
         return
     }
 
-    $ver = Find-WinVersion $build $ltsc
-    $rels = Get-WinReleases $build
+    $ver = Find-WinVersion $family $build $ltsc
+    $rels = Get-WinReleases $family $build
     $bRels = @($rels | Where-Object { $_.Type -eq 'B' })
     if ($bRels.Count -eq 0) { $bRels = @($rels | Where-Object { $_.Type -ne 'Preview' }) }
     $latestB = $bRels | Select-Object -First 1
     $latestAny = $rels | Select-Object -First 1
 
+    # Version / end of servicing
     if ($ver) {
         $eos = $(if ($entClass) { $ver.EosEnterprise } else { $ver.EosHomePro })
         if (-not $eos) { $eos = $(if ($ver.EosEnterprise) { $ver.EosEnterprise } else { $ver.EosHomePro }) }
@@ -1026,27 +1064,33 @@ function Invoke-AnalyzeWindows {
         elseif ($eos -and [datetime]::TryParse($eos, $Inv, [System.Globalization.DateTimeStyles]::None, [ref]$eosDate)) {
             if ($eosDate.Date -lt (Get-Date).Date) { $ended = $true }
             elseif (($eosDate - (Get-Date).Date).TotalDays -le 120) {
-                Add-Finding 'Medium' 'Windows' ("$product $disp reaches end of servicing on " + $eosDate.ToString('yyyy-MM-dd', $Inv)) "Edition $edition. After this date it receives no security updates." 'Plan the feature update (SCCM servicing plan, feature update deployment, or in-place upgrade task sequence).'
+                Add-Finding 'Medium' 'Windows' ("$versionLabel reaches end of support on " + $eosDate.ToString('yyyy-MM-dd', $Inv)) "Edition $edition. After this date it receives no security updates." $(if ($isServer) { 'Plan the in-place upgrade or migration to a supported Windows Server version.' } else { 'Plan the feature update (SCCM servicing plan, feature update deployment, or in-place upgrade task sequence).' })
             }
             $eosText = 'supported until ' + $eosDate.ToString('yyyy-MM-dd', $Inv)
         }
-        $newest = Get-NewestWinVersion $win11
-        $newestText = $(if ($newest) { "$($newest.Version) ($($newest.Major))" } else { '?' })
+        $newest = Get-NewestWinVersion $family $win11
+        $newestText = '?'
+        if ($newest) { $newestText = $(if ($isServer) { $n = $ServerNames[$newest.Major]; if ($n) { $n } else { $newest.Version } } else { "$($newest.Version) ($($newest.Major))" }) }
+        $featureLabel = $(if ($isServer) { "$product (version)" } else { "$product feature version" })
+        $installedLabel = $(if ($isServer) { "$product ($edition)" } else { "$disp ($edition)" })
         if ($ended) {
-            Add-Finding 'Critical' 'Windows' "$product $disp is out of servicing for the $edition edition" "Microsoft no longer ships security updates for this version/edition (unless the device is enrolled in Extended Security Updates). Microsoft lists: $eos" "Upgrade to a supported feature update (newest: $newestText). Until then the device will never show as compliant."
-            Add-UpdateRow "$product feature version" "$disp ($edition)" $newestText 'Out of servicing' 'Feature update required' 'Critical'
+            Add-Finding 'Critical' 'Windows' "$versionLabel is out of support for the $edition edition" "Microsoft no longer ships security updates for this version/edition (unless the device is enrolled in Extended Security Updates). Microsoft lists: $eos" "Upgrade to a supported version (newest: $newestText). Until then the device will never show as compliant."
+            Add-UpdateRow $featureLabel $installedLabel $newestText 'Out of support' $(if ($isServer) { 'In-place upgrade or migration required' } else { 'Feature update required' }) 'Critical'
         }
         else {
             $behindFeature = ($newest -and $newest.Major -ne $build -and -not $ltsc)
             $statusText = $(if ($eosText) { $eosText } else { 'Supported' })
-            Add-UpdateRow "$product feature version" "$disp ($edition)" $(if ($ltsc) { 'LTSC' } else { $newestText }) $statusText $(if ($behindFeature) { 'Optional: newer feature update available' } else { 'None' }) $(if ($behindFeature) { 'Info' } else { 'OK' })
+            $latestShown = $(if ($ltsc -and -not $isServer) { 'LTSC' } else { $newestText })
+            $act = $(if ($behindFeature) { $(if ($isServer) { "Optional: newer Windows Server available ($newestText)" } else { 'Optional: newer feature update available' }) } else { 'None' })
+            Add-UpdateRow $featureLabel $installedLabel $latestShown $statusText $act $(if ($behindFeature) { 'Info' } else { 'OK' })
         }
     }
     else {
-        Add-Finding 'Info' 'Windows' "Build $build is not listed on Microsoft's release information pages" 'Insider, Server, or a version newer than the cached data.' 'Run without -Offline to refresh Microsoft data.'
+        Add-Finding 'Info' 'Windows' "Build $build ($product) is not listed on Microsoft's release information pages" 'Insider/preview build, an unsupported version, or a version newer than the cached data.' 'Run without -Offline to refresh Microsoft data.'
     }
 
-    if (-not $latestB) { Add-UpdateRow "$product cumulative update" $installedBuild 'unknown' 'Not checked' "No release history found for build $build" 'Info'; return }
+    # Monthly cumulative update for THIS OS version
+    if (-not $latestB) { Add-UpdateRow "$product cumulative update" $installedBuild 'unknown' 'Not checked' "No release history found for $product build $build" 'Info'; return }
     $script:R.LatestKb = $latestB.Kb
     $latestText = "$($latestB.BuildText) ($($latestB.Kb), $($latestB.Date))"
     $installedRel = $rels | Where-Object { $_.Ubr -eq $ubr } | Select-Object -First 1
@@ -1060,8 +1104,9 @@ function Invoke-AnalyzeWindows {
         $ageDays = $(if ($latestB.DateValue) { ((Get-Date).Date - $latestB.DateValue).TotalDays } else { 99 })
         $sev = $(if ($behind -ge 3) { 'Critical' } elseif ($behind -eq 2) { 'High' } elseif ($ageDays -lt 14) { 'Low' } else { 'Medium' })
         $monthsText = Plural $behind 'monthly security update'
+        $script:R.MonthsBehind = $behind
         Add-UpdateRow "$product cumulative update" $installedText $latestText "$monthsText behind" "Install $($latestB.Kb)" $sev
-        Add-Finding $sev 'Windows' "Windows is $monthsText behind" "Installed build $installedText. Latest security update for $product $disp is $($latestB.Kb) (build $($latestB.BuildText), released $($latestB.Date))." "Deploy $($latestB.Kb) from SCCM. The SCCM server checks and client findings below explain why it hasn't installed."
+        Add-Finding $sev 'Windows' "$versionLabel is $monthsText behind" "Installed build $installedText. Latest security update for $versionLabel is $($latestB.Kb) (build $($latestB.BuildText), released $($latestB.Date))." "Deploy $($latestB.Kb) from SCCM. The SCCM server checks and client findings below explain why it hasn't installed."
     }
     if ($latestAny -and $latestAny.Ubr -gt $latestB.Ubr -and $ubr -lt $latestAny.Ubr -and $latestAny.Type -eq 'OOB') {
         Add-Finding 'Medium' 'Windows' "Out-of-band update $($latestAny.Kb) is available" "Build $($latestAny.BuildText) released $($latestAny.Date) (out-of-band fixes are usually for urgent issues)." 'Check the KB article; import/deploy it in SCCM if it applies to you.'
@@ -1087,15 +1132,21 @@ function Invoke-AnalyzeDotNet {
     if ($null -eq $release) {
         Add-Finding 'Medium' '.NET' 'No .NET Framework 4.x detected' 'The NDP\v4\Full registry key is missing (unusual on Windows 10/11).' 'Repair .NET Framework through Windows Features or an in-place repair.'
     }
-    elseif ($release -lt 528040) {
-        Add-UpdateRow '.NET Framework' "$fv (release $release)" '4.8.1' 'Outdated' 'Deploy .NET Framework 4.8.1 (or 4.8)' 'Medium'
-        Add-Finding 'Medium' '.NET' ".NET Framework $fv is older than 4.8" 'Older Framework versions miss current security fixes and some app requirements.' 'Deploy .NET Framework 4.8.1 from SCCM.'
-    }
-    elseif ($release -lt 533320 -and $X.Build -ge 19044) {
-        Add-UpdateRow '.NET Framework' "$fv (release $release)" '4.8.1' 'Supported' 'Optional: 4.8.1 available for this OS' 'Info'
-    }
     else {
-        Add-UpdateRow '.NET Framework' "$fv (release $release)" '4.8.1' 'Current' 'Monthly Framework security fixes ship in the .NET Framework cumulative update (see missing updates)' 'OK'
+        # Newest Framework this OS can run: 4.8.1 needs Windows 10 21H2+/Windows 11 or Server 2022+; older OSes top out at 4.8
+        $supports481 = $(if ($X.IsServer) { $X.Build -ge 20348 } else { $X.Build -ge 19044 })
+        $osMax = $(if ($supports481) { '4.8.1' } else { '4.8' })
+        $cuNote = 'Monthly Framework security fixes ship in the .NET Framework cumulative update (see missing updates)'
+        if ($release -lt 528040) {
+            Add-UpdateRow '.NET Framework' "$fv (release $release)" $osMax 'Outdated' "Deploy .NET Framework $osMax" 'Medium'
+            Add-Finding 'Medium' '.NET' ".NET Framework $fv is older than 4.8" "Older Framework versions miss current security fixes and some app requirements. The newest version for this OS is $osMax." "Deploy .NET Framework $osMax from SCCM."
+        }
+        elseif ($release -lt 533320 -and $supports481) {
+            Add-UpdateRow '.NET Framework' "$fv (release $release)" '4.8.1' 'Supported' 'Optional: 4.8.1 is available for this OS' 'Info'
+        }
+        else {
+            Add-UpdateRow '.NET Framework' "$fv (release $release)" $osMax 'Current' $cuNote 'OK'
+        }
     }
 
     $installs = ja $C 'DotNet.Installs'
@@ -1648,7 +1699,7 @@ function Invoke-Analysis($Data) {
         Missing = (New-Object System.Collections.ArrayList); RecentInstalls = (New-Object System.Collections.ArrayList)
         EventGroups = (New-Object System.Collections.ArrayList); Notes = (New-Object System.Collections.ArrayList)
         Server = $null; ServerName = $null; ServerError = $null; SiteCode = $null; SiteVersion = $null
-        Wsus = $null; WsusError = $null; LatestKb = $null; CuPattern = $null
+        Wsus = $null; WsusError = $null; LatestKb = $null; CuPattern = $null; MonthsBehind = 0
     }
     $name = js $Data 'System.ComputerName'; if (-not $name) { $name = js $Data 'Meta.ComputerName' }
     $script:R.ComputerName = $name
@@ -1660,8 +1711,9 @@ function Invoke-Analysis($Data) {
     $disp = js $Data 'System.DisplayVersion'; if (-not $disp) { $disp = js $Data 'System.ReleaseId' }
     $edition = js $Data 'System.EditionID'; if (-not $edition) { $edition = '' }
     $arch = js $Data 'System.UpdateArch'; if (-not $arch) { $arch = 'x64' }
+    $isServer = (([string](js $Data 'System.InstallationType')) -match 'Server') -or ($edition -match '^Server')
     $script:Ctx = [pscustomobject]@{
-        RefNow = $refNow; Days = $days; Build = $build; Ubr = $ubr; Disp = $disp; Edition = $edition; Arch = $arch
+        RefNow = $refNow; Days = $days; Build = $build; Ubr = $ubr; Disp = $disp; Edition = $edition; Arch = $arch; IsServer = $isServer
         SccmInstalled = (jb $Data 'Sccm.Installed'); LikelyOffline = (jb $Data 'Meta.LikelyOffline')
     }
 
@@ -2030,13 +2082,14 @@ function Build-Report($Res) {
     Write-KV @(
         , @('Windows 11 release information', (Get-SourceText 'windows11-release-information.html'))
         , @('Windows 10 release information', (Get-SourceText 'windows10-release-information.html'))
+        , @('Windows Server release information', (Get-SourceText 'windows-server-release-information.html'))
         , @('.NET releases index', (Get-SourceText 'dotnet-releases-index.json'))
         , @('SCCM SMS Provider', $smsText)
         , @('WSUS', $wsusText)
         , @('Bundle', $Res.BundlePath)
         , @('Analyzer', "PowerShell $AnalyzerVersion")
     )
-    W ('<p class="small muted">Microsoft pages: ' + (Enc $Win11Url) + ' and ' + (Enc $Win10Url) + '</p></section>')
+    W ('<p class="small muted">Microsoft pages: ' + (Enc $Win11Url) + ', ' + (Enc $Win10Url) + ' and ' + (Enc $ServerUrls[0]) + '</p></section>')
     W '</main></body></html>'
     return $script:SB.ToString()
 }
@@ -2093,7 +2146,10 @@ function Export-AnalysisJson($Res, [string]$Path) {
         ComputerName = $Res.ComputerName; CollectedAt = (Fmt $Res.CollectedAt); AnalyzedAt = (Fmt (Get-Date)); AnalyzerVersion = "PowerShell $AnalyzerVersion"
         Summary = $summary; Updates = $Res.Updates; Findings = $Res.Findings; MissingUpdates = $Res.Missing; RecentInstalls = $Res.RecentInstalls; Notes = $Res.Notes
         MicrosoftData = [ordered]@{
-            WindowsVersions = $script:WinVersions.Count; WindowsReleaseBuilds = @($script:WinReleases.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+            WindowsVersions = @($script:WinVersions | Where-Object { $_.Family -eq 'Client' }).Count
+            WindowsReleaseBuilds = (@($script:WinReleases.Keys | Where-Object { $_ -like 'Client|*' } | ForEach-Object { $script:WinReleases[$_].Count }) | Measure-Object -Sum).Sum
+            ServerVersions = @($script:WinVersions | Where-Object { $_.Family -eq 'Server' }).Count
+            ServerReleaseBuilds = (@($script:WinReleases.Keys | Where-Object { $_ -like 'Server|*' } | ForEach-Object { $script:WinReleases[$_].Count }) | Measure-Object -Sum).Sum
             DotNetChannels = $script:DotNetChannels.Count
         }
     }
@@ -2110,6 +2166,192 @@ function Export-AnalysisJson($Res, [string]$Path) {
     if ($Res.Wsus) { $doc.Wsus = $Res.Wsus }
     $json = ConvertTo-Json -InputObject (ConvertTo-Plain $doc) -Depth 12
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+#endregion
+
+#region Results window ----------------------------------------------------------------------
+
+function Get-SystemSummary($Res) {
+    $osRow = $Res.Updates | Where-Object { $_.Component -like '*cumulative update' } | Select-Object -First 1
+    $verRow = $Res.Updates | Where-Object { $_.Component -like '*feature version' -or $_.Component -like '*(version)' } | Select-Object -First 1
+    $kb = $null
+    if ($osRow -and $osRow.Latest -match '(KB\d+)') { $kb = $Matches[1] }
+    $netBad = @($Res.Updates | Where-Object { $_.Component -match '\.NET' -and @('Critical', 'High', 'Medium') -contains $_.Severity }).Count
+    $worst = 'OK'
+    foreach ($f in $Res.Findings) { if ((Get-SevRank $f.Severity) -lt (Get-SevRank $worst)) { $worst = $f.Severity } }
+    return [pscustomobject]@{
+        Computer   = $Res.ComputerName
+        OS         = $(if ($verRow) { $verRow.Installed } else { $null })
+        Build      = $Res.FullBuild
+        Windows    = $(if ($osRow) { $osRow.Status } else { 'Not checked' })
+        LatestKb   = $(if ($osRow -and $osRow.Status -ne 'Current') { $kb } else { $null })
+        Support    = $(if ($verRow) { $verRow.Status } else { $null })
+        DotNet     = $(if ($netBad -gt 0) { "$netBad to update" } else { 'OK' })
+        Critical   = (Get-SevCount $Res 'Critical')
+        High       = (Get-SevCount $Res 'High')
+        Medium     = (Get-SevCount $Res 'Medium')
+        Worst      = $worst
+    }
+}
+
+function Get-SevColor([string]$Sev) {
+    switch ($Sev) {
+        'Critical' { return [System.Drawing.Color]::FromArgb(255, 205, 205) }
+        'High'     { return [System.Drawing.Color]::FromArgb(255, 222, 190) }
+        'Medium'   { return [System.Drawing.Color]::FromArgb(255, 243, 190) }
+        'Low'      { return [System.Drawing.Color]::FromArgb(219, 234, 254) }
+        default    { return [System.Drawing.Color]::FromArgb(222, 242, 222) }
+    }
+}
+
+function New-Grid([string[]]$Columns, [int[]]$Weights, [bool]$Wrap) {
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.Dock = 'Fill'
+    $g.ReadOnly = $true
+    $g.AllowUserToAddRows = $false
+    $g.AllowUserToDeleteRows = $false
+    $g.AllowUserToResizeRows = $false
+    $g.RowHeadersVisible = $false
+    $g.SelectionMode = 'FullRowSelect'
+    $g.MultiSelect = $false
+    $g.AutoSizeColumnsMode = 'Fill'
+    $g.BackgroundColor = [System.Drawing.Color]::White
+    $g.BorderStyle = 'None'
+    if ($Wrap) {
+        $g.DefaultCellStyle.WrapMode = 'True'
+        $g.AutoSizeRowsMode = 'AllCells'
+    }
+    for ($i = 0; $i -lt $Columns.Count; $i++) {
+        $idx = $g.Columns.Add("c$i", $Columns[$i])
+        if ($Weights -and $i -lt $Weights.Count) { $g.Columns[$idx].FillWeight = $Weights[$i] }
+    }
+    return $g
+}
+
+function Show-ResultsWindow($Results) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+    }
+    catch { Write-Warning "Results window unavailable: $($_.Exception.Message)"; return }
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $ui = @{}
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "UpdateHealthKit - $($Results.Count) system(s) analyzed"
+    $form.Size = New-Object System.Drawing.Size(1300, 820)
+    $form.StartPosition = 'CenterScreen'
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $header = New-Object System.Windows.Forms.Label
+    $header.Dock = 'Top'
+    $header.Height = 30
+    $header.Padding = New-Object System.Windows.Forms.Padding(8, 7, 0, 0)
+    $header.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $header.Text = 'Systems - select one to see what it needs and why it is not updating'
+
+    $split = New-Object System.Windows.Forms.SplitContainer
+    $split.Dock = 'Fill'
+    $split.Orientation = 'Horizontal'
+
+    $sysGrid = New-Grid @('Computer', 'OS', 'Build', 'Windows updates', 'Latest KB needed', 'Support', '.NET', 'Critical', 'High', 'Medium') @(110, 150, 80, 170, 90, 140, 80, 50, 45, 50) $false
+    $split.Panel1.Controls.Add($sysGrid)
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Dock = 'Fill'
+    $tabNeeds = New-Object System.Windows.Forms.TabPage; $tabNeeds.Text = 'What needs updating'
+    $tabWhy = New-Object System.Windows.Forms.TabPage; $tabWhy.Text = 'Why it is not updating'
+    $tabNotes = New-Object System.Windows.Forms.TabPage; $tabNotes.Text = 'Notes'
+    $needsGrid = New-Grid @('Severity', 'Component', 'Installed', 'Latest', 'Status', 'Action') @(55, 170, 150, 170, 150, 200) $true
+    $whyGrid = New-Grid @('Severity', 'Area', 'Finding', 'Details', 'Recommended fix') @(55, 80, 200, 260, 260) $true
+    $notesBox = New-Object System.Windows.Forms.TextBox
+    $notesBox.Multiline = $true; $notesBox.ReadOnly = $true; $notesBox.ScrollBars = 'Vertical'; $notesBox.Dock = 'Fill'
+    $notesBox.BackColor = [System.Drawing.Color]::White
+    $tabNeeds.Controls.Add($needsGrid); $tabWhy.Controls.Add($whyGrid); $tabNotes.Controls.Add($notesBox)
+    $tabs.TabPages.AddRange(@($tabNeeds, $tabWhy, $tabNotes))
+    $split.Panel2.Controls.Add($tabs)
+
+    $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $buttons.Dock = 'Bottom'
+    $buttons.Height = 42
+    $buttons.FlowDirection = 'RightToLeft'
+    $buttons.Padding = New-Object System.Windows.Forms.Padding(6)
+    $btnClose = New-Object System.Windows.Forms.Button; $btnClose.Text = 'Close'; $btnClose.Width = 90
+    $btnFolder = New-Object System.Windows.Forms.Button; $btnFolder.Text = 'Open report folder'; $btnFolder.Width = 140
+    $btnReport = New-Object System.Windows.Forms.Button; $btnReport.Text = 'Open HTML report'; $btnReport.Width = 140
+    $btnShowAll = New-Object System.Windows.Forms.CheckBox; $btnShowAll.Text = 'Show items that are already current'; $btnShowAll.AutoSize = $true
+    $btnShowAll.Padding = New-Object System.Windows.Forms.Padding(0, 6, 20, 0)
+    $buttons.Controls.AddRange(@($btnClose, $btnFolder, $btnReport, $btnShowAll))
+
+    $ui.Sys = $sysGrid; $ui.Needs = $needsGrid; $ui.Why = $whyGrid; $ui.Notes = $notesBox; $ui.ShowAll = $btnShowAll; $ui.Tabs = $tabs; $ui.NeedsTab = $tabNeeds
+    $script:Ui = $ui
+
+    foreach ($res in $Results) {
+        $sum = Get-SystemSummary $res
+        $i = $sysGrid.Rows.Add($sum.Computer, $sum.OS, $sum.Build, $sum.Windows, $sum.LatestKb, $sum.Support, $sum.DotNet, $sum.Critical, $sum.High, $sum.Medium)
+        $sysGrid.Rows[$i].Tag = $res
+        $sysGrid.Rows[$i].DefaultCellStyle.BackColor = Get-SevColor $sum.Worst
+    }
+
+    $fill = {
+      try {
+        $u = $script:Ui
+        $u.Needs.Rows.Clear(); $u.Why.Rows.Clear(); $u.Notes.Text = ''
+        if ($u.Sys.SelectedRows.Count -eq 0) { return }
+        $res = $u.Sys.SelectedRows[0].Tag
+        if (-not $res) { return }
+        $items = @($res.Updates | Sort-Object { Get-SevRank $_.Severity })
+        if (-not $u.ShowAll.Checked) { $items = @($items | Where-Object { $_.Severity -ne 'OK' }) }
+        foreach ($x in $items) {
+            $n = $u.Needs.Rows.Add($x.Severity, $x.Component, $x.Installed, $x.Latest, $x.Status, $x.Action)
+            $u.Needs.Rows[$n].DefaultCellStyle.BackColor = Get-SevColor $x.Severity
+        }
+        $u.NeedsTab.Text = "What needs updating ($($items.Count))"
+        foreach ($f in $res.Findings) {
+            $n = $u.Why.Rows.Add($f.Severity, $f.Area, $f.Title, $f.Detail, $f.Fix)
+            $u.Why.Rows[$n].DefaultCellStyle.BackColor = Get-SevColor $f.Severity
+        }
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add("Computer: $($res.ComputerName)    Collected: $(Fmt $res.CollectedAt)")
+        $lines.Add("Report: $($res.ReportPath)")
+        $lines.Add('')
+        foreach ($nt in $res.Notes) { $lines.Add('- ' + $nt) }
+        $u.Notes.Lines = $lines.ToArray()
+      }
+      catch { $script:GuiError = $_; Write-Warning "Results window: $($_.Exception.Message)" }
+    }
+    $sysGrid.Add_SelectionChanged($fill)
+    $btnShowAll.Add_CheckedChanged($fill)
+    $sysGrid.Add_CellDoubleClick({ $r = $script:Ui.Sys.SelectedRows; if ($r.Count -gt 0 -and $r[0].Tag) { Start-Process $r[0].Tag.ReportPath } })
+    $btnReport.Add_Click({ $r = $script:Ui.Sys.SelectedRows; if ($r.Count -gt 0 -and $r[0].Tag) { Start-Process $r[0].Tag.ReportPath } })
+    $btnFolder.Add_Click({ $r = $script:Ui.Sys.SelectedRows; if ($r.Count -gt 0 -and $r[0].Tag) { Start-Process 'explorer.exe' -ArgumentList ('"' + (Split-Path $r[0].Tag.ReportPath) + '"') } })
+    $btnClose.Add_Click({ $form.Close() })
+
+    $form.Controls.Add($split)
+    $form.Controls.Add($header)
+    $form.Controls.Add($buttons)
+    $form.Add_Shown({
+            $split.SplitterDistance = [int]($split.Height * 0.35)
+            if ($script:Ui.Sys.Rows.Count -gt 0) { $script:Ui.Sys.Rows[0].Selected = $true; & $fill }
+            $form.Activate()
+            if ($GuiTestSeconds -gt 0) {
+                foreach ($row in $script:Ui.Sys.Rows) { $row.Selected = $true; & $fill }
+                $script:Ui.ShowAll.Checked = $true
+                $script:Ui.ShowAll.Checked = $false
+                $t = New-Object System.Windows.Forms.Timer
+                $t.Interval = 1000 * $GuiTestSeconds
+                $t.Add_Tick({ $form.Close() })
+                $t.Start()
+            }
+        })
+    $script:GuiError = $null
+    [void]$form.ShowDialog()
+    $form.Dispose()
+    if ($GuiTestSeconds -gt 0) {
+        if ($script:GuiError) { throw "Results window error: $($script:GuiError.Exception.Message)" }
+        Write-Host "Results window test: OK ($($Results.Count) systems shown)"
+    }
 }
 
 #endregion
@@ -2162,11 +2404,14 @@ Write-Host "Bundles to analyze: $($bundles.Count)"
 
 # Microsoft reference data
 if ($Offline) { Write-Host 'Offline mode: using cached Microsoft data only.' } else { Write-Host 'Downloading Microsoft release data...' }
-Read-WindowsReleaseHtml (Get-CachedText 'windows11-release-information.html' @($Win11Url))
-Read-WindowsReleaseHtml (Get-CachedText 'windows10-release-information.html' @($Win10Url))
+Read-WindowsReleaseHtml (Get-CachedText 'windows11-release-information.html' @($Win11Url)) 'Client'
+Read-WindowsReleaseHtml (Get-CachedText 'windows10-release-information.html' @($Win10Url)) 'Client'
+Read-WindowsReleaseHtml (Get-CachedText 'windows-server-release-information.html' $ServerUrls) 'Server'
 Read-DotNetIndex
-Write-Host ("  Windows versions: {0}, release builds: {1}, .NET channels: {2}" -f $script:WinVersions.Count,
-    (@($script:WinReleases.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum), $script:DotNetChannels.Count)
+$clientRel = (@($script:WinReleases.Keys | Where-Object { $_ -like 'Client|*' } | ForEach-Object { $script:WinReleases[$_].Count }) | Measure-Object -Sum).Sum
+$serverRel = (@($script:WinReleases.Keys | Where-Object { $_ -like 'Server|*' } | ForEach-Object { $script:WinReleases[$_].Count }) | Measure-Object -Sum).Sum
+Write-Host ("  Windows client: {0} versions / {1} release builds; Windows Server: {2} versions / {3} release builds; .NET channels: {4}" -f
+    @($script:WinVersions | Where-Object { $_.Family -eq 'Client' }).Count, $clientRel, @($script:WinVersions | Where-Object { $_.Family -eq 'Server' }).Count, $serverRel, $script:DotNetChannels.Count)
 
 if ($SiteServer) {
     Write-Host "Connecting to SMS Provider $SiteServer..."
@@ -2215,6 +2460,13 @@ if ($results.Count -gt 1) {
     if ($Open) { Start-Process $index }
 }
 elseif ($results.Count -eq 1 -and $Open) { Start-Process $results[0].ReportPath }
+
+if ($results.Count -gt 0 -and $GuiTestSeconds -gt 0) { Show-ResultsWindow $results }
+elseif ($results.Count -gt 0 -and -not $NoGui) {
+    if (-not [Environment]::UserInteractive) { Write-Host 'Non-interactive session: results window skipped.' }
+    elseif ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { Write-Warning 'Results window needs an STA session (run in Windows PowerShell without -MTA). Use the HTML report instead.' }
+    else { Show-ResultsWindow $results }
+}
 
 foreach ($n in $script:CacheNotes) { Write-Host "NOTE: $n" }
 if ($failures -gt 0) { exit 1 }

@@ -1,81 +1,52 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Authenticode-signs the collector and the PowerShell analyzer, and (optionally) compiles the
-    C# analyzer UpdateHealthAnalyzer.exe with the compiler built into .NET Framework 4.8.
+    Authenticode-signs the UpdateHealthKit scripts (collector, analyzer and this script) so they
+    run under AppLocker / AllSigned execution policy.
 
 .DESCRIPTION
-    No Visual Studio or SDK needed: uses %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe.
-    Signing picks the newest valid code-signing certificate (with private key) in
-    Cert:\CurrentUser\My unless -Thumbprint is given. Re-run after editing any file, because
-    editing a signed script invalidates its signature.
+    Uses the newest valid code-signing certificate (with private key) in Cert:\CurrentUser\My,
+    or the one given by -Thumbprint, with SHA-256 and a timestamp. Run it on a PC with internet so
+    the timestamp server is reachable; a timestamped signature stays valid after the certificate
+    expires. Re-run it after editing any script, because an edit invalidates the signature.
+
+    List your code-signing certificates with:
+        Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object Thumbprint, Subject, NotAfter
 
 .PARAMETER Thumbprint
     Thumbprint of the code-signing certificate to use (CurrentUser\My or LocalMachine\My).
 .PARAMETER TimestampServer
-    RFC 3161 / Authenticode timestamp URL. Default http://timestamp.digicert.com.
-    If it can't be reached the files are signed without a timestamp (signature then stops
-    validating when the certificate expires).
-.PARAMETER SkipSign
-    Compile only.
+    Authenticode timestamp URL. Default http://timestamp.digicert.com. If it can't be reached the
+    files are signed without a timestamp (the signature then stops validating when the
+    certificate expires) and a warning is shown.
 .PARAMETER SignOnly
-    Don't compile; just sign the scripts (and the .exe if present). Use this on the unsigned
-    files downloaded from the GitHub "latest" release, or when you only use the PowerShell analyzer.
-.PARAMETER CscPath
-    Use a different csc.exe (e.g. Roslyn from Visual Studio Build Tools).
+    Accepted for compatibility with older instructions; signing is all this script does.
 
 .EXAMPLE
-    .\Build-UpdateHealthKit.ps1
+    .\Build\Build-UpdateHealthKit.ps1
+
+    Signs both scripts with your newest code-signing certificate.
+
 .EXAMPLE
-    .\Build-UpdateHealthKit.ps1 -SignOnly
-.EXAMPLE
-    .\Build-UpdateHealthKit.ps1 -Thumbprint 1A2B3C... -TimestampServer http://timestamp.sectigo.com
+    .\Build\Build-UpdateHealthKit.ps1 -Thumbprint 1A2B3C4D5E6F...
+
+    Signs with a specific certificate.
 #>
 [CmdletBinding()]
 param(
     [string]$Thumbprint,
     [string]$TimestampServer = 'http://timestamp.digicert.com',
-    [switch]$SkipSign,
-    [switch]$SignOnly,
-    [string]$CscPath
+    [switch]$SignOnly
 )
 
 $ErrorActionPreference = 'Stop'
-$root      = Split-Path -Parent $PSScriptRoot
-$srcDir    = Join-Path $root 'Analyzer\src'
-$outExe    = Join-Path $root 'Analyzer\UpdateHealthAnalyzer.exe'
-$collector = Join-Path $root 'Collector\Invoke-UpdateHealthCollector.ps1'
-$psAnalyzer = Join-Path $root 'Analyzer\Invoke-UpdateHealthAnalyzer.ps1'
+$root = Split-Path -Parent $PSScriptRoot
+$toSign = @(
+    (Join-Path $root 'Collector\Invoke-UpdateHealthCollector.ps1'),
+    (Join-Path $root 'Analyzer\Invoke-UpdateHealthAnalyzer.ps1'),
+    $PSCommandPath
+) | Where-Object { Test-Path -LiteralPath $_ }
 
-# ---- Compile -------------------------------------------------------------------------------
-if ($SignOnly) {
-    Write-Host 'Skipping compile (-SignOnly).'
-}
-else {
-$csc = $CscPath
-if (-not $csc) {
-    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    if (-not (Test-Path -LiteralPath $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
-}
-if (-not (Test-Path -LiteralPath $csc)) { throw "csc.exe not found ($csc). .NET Framework 4.8 is required." }
-
-$sources = @(Get-ChildItem -LiteralPath $srcDir -Filter '*.cs' | ForEach-Object { $_.FullName })
-if ($sources.Count -eq 0) { throw "No .cs files found in $srcDir" }
-
-$refs = @('System.dll', 'System.Core.dll', 'System.Management.dll', 'System.Web.Extensions.dll',
-          'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
-$cscArgs = @('/nologo', '/target:exe', '/optimize+', '/platform:anycpu', '/warn:3', "/out:$outExe") +
-           @($refs | ForEach-Object { "/reference:$_" }) + $sources
-
-Write-Host "Compiling $($sources.Count) source files with $csc" -ForegroundColor Cyan
-& $csc @cscArgs
-if ($LASTEXITCODE -ne 0) { throw "Compilation failed (exit code $LASTEXITCODE). See the errors above." }
-Write-Host "Built $outExe" -ForegroundColor Green
-}
-
-if ($SkipSign) { Write-Host 'Skipping signing (-SkipSign).'; return }
-
-# ---- Sign ----------------------------------------------------------------------------------
 $cert = $null
 if ($Thumbprint) {
     $tp = ($Thumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
@@ -87,15 +58,12 @@ else {
         Where-Object { $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date) } |
         Sort-Object NotAfter -Descending | Select-Object -First 1
 }
-if (-not $cert) { throw 'No valid code-signing certificate found. Pass -Thumbprint, or use -SkipSign to compile only.' }
+if (-not $cert) { throw 'No valid code-signing certificate found. Pass -Thumbprint (see Get-Help .\Build\Build-UpdateHealthKit.ps1).' }
 Write-Host ("Signing with {0} (thumbprint {1}, expires {2:yyyy-MM-dd})" -f $cert.Subject, $cert.Thumbprint, $cert.NotAfter) -ForegroundColor Cyan
 
-$toSign = @($psAnalyzer, $collector, $outExe, $PSCommandPath) | Where-Object { Test-Path -LiteralPath $_ }
 foreach ($file in $toSign) {
     $sig = $null
-    try {
-        $sig = Set-AuthenticodeSignature -FilePath $file -Certificate $cert -HashAlgorithm SHA256 -TimestampServer $TimestampServer -ErrorAction Stop
-    }
+    try { $sig = Set-AuthenticodeSignature -FilePath $file -Certificate $cert -HashAlgorithm SHA256 -TimestampServer $TimestampServer -ErrorAction Stop }
     catch { $sig = $null }
     if (-not $sig -or $sig.Status -ne 'Valid') {
         Write-Warning "Timestamped signing failed for $(Split-Path $file -Leaf); signing without a timestamp."
@@ -105,5 +73,4 @@ foreach ($file in $toSign) {
 }
 
 Write-Host ''
-Write-Host 'Done. Copy Collector\Invoke-UpdateHealthCollector.ps1 to the problem PC (USB is fine) and keep' -ForegroundColor Green
-Write-Host 'Analyzer\UpdateHealthAnalyzer.exe on your online admin PC.' -ForegroundColor Green
+Write-Host 'Done. Copy the folder to the problem PC (USB is fine) and run Collector\Invoke-UpdateHealthCollector.ps1 as Administrator.' -ForegroundColor Green
