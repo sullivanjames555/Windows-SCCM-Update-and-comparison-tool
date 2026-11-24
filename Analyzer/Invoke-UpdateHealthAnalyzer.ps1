@@ -462,6 +462,11 @@ $SignatureFixes = @{
     APPLOCKER         = 'Installers are blocked by AppLocker/WDAC (0x800704EC/0x800711C7). Add allow rules for C:\Windows\ccmcache\*, C:\Windows\CCM\* and C:\Windows\SoftwareDistribution\Download\* or Microsoft publisher rules for MSI/EXE/script.'
     WMI               = 'Check WMI: winmgmt /verifyrepository (salvage if inconsistent), then repair the client (ccmsetup /forceinstall or ccmrepair.exe).'
     APP_FAIL          = 'Review AppEnforce.log for the exit code and the detection method of the failing application.'
+    REBOOT_SUPPRESSED = 'Someone postponed the restart or the deployment suppresses it (common for server collections). Restart the device in a window you control, or change the deployment / client settings restart behaviour.'
+    DISK_SPACE        = 'Free disk space on the system drive and/or raise the client cache size; clear old ccmcache content (Configuration Manager applet > Cache > Delete Files).'
+    BUSY              = 'Another installer was running (Windows Installer allows one at a time). Find the stuck msiexec/TiWorker process (see Deeper diagnostics), let it finish or restart the device, then retry.'
+    MAX_RUNTIME       = "The update's maximum run time is longer than the maintenance window, so it never starts. Lengthen the window or lower the update's Maximum run time (Software Library > update > Properties)."
+    BATTERY           = 'Laptop was on battery; installs wait for AC power. Plug it in, or change the deployment to allow installs on battery.'
 }
 
 #endregion
@@ -1627,6 +1632,157 @@ function Invoke-AnalyzeSccmClient {
     }
 }
 
+function Invoke-AnalyzeDiagnostics {
+    $C = $script:C; $X = $script:Ctx
+    $D = jdict $C 'Diagnostics'
+    if (-not $D) { return }
+
+    # Partitions that Windows servicing needs room on
+    foreach ($p in (ja $D 'Partitions')) {
+        $type = [string](js $p 'Type'); $free = jd $p 'FreeMB'; $size = jd $p 'SizeMB'
+        if ($null -eq $free) { continue }
+        if (($type -match 'System' -and $free -lt 15) -or ($type -match 'Recovery' -and $free -lt 50)) {
+            Add-Finding 'Medium' 'Disk' ("$type partition has only " + [int]$free + " MB free (of " + [int]$size + ' MB)') 'Cumulative and WinRE/boot updates write to the EFI/System and Recovery partitions; too little room there fails installs with 0x800F0922.' "Extend the partition or free space on it (Microsoft's 'resize the recovery partition' guidance), then retry the update."
+        }
+    }
+    foreach ($v in (ja $D 'Volumes')) {
+        $letter = js $v 'DriveLetter'; $free = jd $v 'FreeMB'; $cap = jd $v 'CapacityMB'
+        if (-not $letter -or $null -eq $free -or -not $cap) { continue }
+        if ($letter -eq (js $C 'System.SystemDrive')) { continue }   # system drive handled elsewhere
+        if ($free / $cap -lt 0.05 -and $free -lt 5120) { Add-Finding 'Low' 'Disk' ("$letter is almost full (" + [math]::Round($free / 1024, 1) + ' GB free)') 'Not the system drive, but the SCCM cache or SoftwareDistribution may have been moved there.' 'Free space on that drive.' }
+    }
+    $winre = js $D 'WinRE.Status'
+    if ($winre -and $winre -notmatch 'Enabled') { Add-Finding 'Low' 'Servicing' "Windows Recovery Environment is $winre" 'Some cumulative updates also service WinRE; a disabled or broken WinRE can fail that part of the update.' 'reagentc /enable (check reagentc /info), or fix the Recovery partition.' }
+
+    # Restart blockers
+    $hiber = ji $D 'FastStartup.HiberbootEnabled'; $hibernate = ji $D 'FastStartup.HibernateEnabled'
+    $pending = jb $C 'PendingReboot.Any'
+    $up = jd $C 'System.UptimeDays'
+    if (-not $X.IsServer -and $hiber -eq 1 -and $hibernate -ne 0) {
+        if ($pending -or ($null -ne $up -and $up -gt 7)) {
+            Add-Finding 'High' 'Restart' 'Fast Startup is on, so "Shut down" never really restarts Windows' ("Uptime is " + $(if ($null -ne $up) { $up.ToString('0.#', $Inv) } else { '?' }) + ' days' + $(if ($pending) { ' with a restart pending' } else { '' }) + '. With Fast Startup, shutting down hibernates the kernel, so pending updates are never finalized; only Restart does that.') 'Tell users to use Restart, or turn Fast Startup off by GPO (Computer Configuration > Administrative Templates > System > Shutdown > Require use of fast startup = Disabled, or HiberbootEnabled = 0).'
+        }
+        else { Add-Note 'Fast Startup is enabled. If users shut down instead of restarting, pending updates will not finish.' }
+    }
+    if (jb $D 'Battery.OnBattery') { Add-Finding 'Low' 'Restart' ("Device was on battery (" + (js $D 'Battery.ChargePercent') + '% charge) when collected') 'Software updates and restarts are often deferred on battery.' 'Plug it in during the maintenance window.' }
+    $rb = jdict $D 'CcmRebootData'
+    if ($rb -and $rb.Count -gt 0) {
+        $by = jl $rb 'RebootBy'
+        $byText = $null
+        $byDate = $null
+        try {
+            if ($by -gt 1000000000 -and $by -lt 4000000000) { $byDate = ([datetime]'1970-01-01Z').ToUniversalTime().AddSeconds($by).ToLocalTime() }   # Unix seconds
+            elseif ($by -gt 100000000000000000) { $byDate = [datetime]::FromFileTimeUtc($by).ToLocalTime() }                                     # FILETIME
+        }
+        catch { $byDate = $null }
+        if ($byDate) { $byText = Fmt $byDate }
+        $hard = jb $rb 'HardReboot'
+        if ($byText -and $byDate -lt $X.RefNow) {
+            Add-Finding 'High' 'Restart' "SCCM's restart deadline ($byText) has passed but the device hasn't restarted" ('The SCCM client is waiting to restart' + $(if ($hard) { ' (hard reboot required)' } else { '' }) + '. Something is blocking or postponing it: a logged-on user postponing, a suppressed restart, or a stuck shutdown.') 'Restart the device. Check RebootCoordinator.log and the "Restart blockers" evidence below; review the client setting "Configuration Manager can force a device to restart".'
+        }
+        elseif ($byText) { Add-Note "SCCM has a restart scheduled by $byText." }
+    }
+    $sessions = js $D 'Sessions'
+    $consoleUser = js $D 'ConsoleUser'
+    if ($pending -and ($sessions -or $consoleUser)) {
+        Add-Note ('Users signed in while a restart is pending: ' + $(if ($consoleUser) { "$consoleUser (console)" } else { '' }) + $(if ($sessions) { '; sessions: ' + (Short $sessions 200) } else { '' }) + '. SCCM waits for or prompts these users before restarting.')
+    }
+    $rbEvents = @(ja $C 'Events' | Where-Object { (js $_ 'Tag') -eq 'RestartBlock' })
+    if ($rbEvents.Count -gt 0) {
+        Add-Finding 'Medium' 'Restart' ((Plural $rbEvents.Count 'application') + ' blocked or delayed a shutdown/restart (Restart Manager)') (@($rbEvents | Select-Object -First 4 | ForEach-Object { Short (js $_ 'Message') 160 }) -join ' | ') 'Close or update the listed applications; consider forcing restarts in the deployment once users have been notified.'
+    }
+    $lastRestart = @(ja $C 'Events' | Where-Object { (ji $_ 'Id') -eq 1074 } | Sort-Object { [string](js $_ 'Time') } -Descending) | Select-Object -First 1
+    if ($lastRestart) { Add-Note ('Last planned restart/shutdown (event 1074) at ' + (Fmt (jt $lastRestart 'Time')) + ': ' + (Short (js $lastRestart 'Message') 220)) }
+
+    # Something running that blocks installs
+    $stuck = @(ja $D 'BusyProcesses' | Where-Object { (jl $_ 'RunningMinutes') -ge 120 -and @('msiexec', 'TiWorker', 'wusa', 'DismHost', 'dism', 'setup', 'SetupHost', 'ccmsetup') -contains (js $_ 'Name') })
+    if ($stuck.Count -gt 0) {
+        $list = @($stuck | ForEach-Object { (js $_ 'Name') + ' (PID ' + (js $_ 'Id') + ', running ' + [math]::Round((jl $_ 'RunningMinutes') / 60, 1) + ' h)' }) -join ', '
+        Add-Finding 'High' 'Blocked' "An installer has been running for hours: $list" 'Windows Installer and the servicing stack run one install at a time. A hung installer makes every update and application install wait or fail (0x80070652 "another installation is already in progress").' 'Find what launched it (parent process / AppEnforce.log), end it or restart the device, then trigger the Software Updates Deployment Evaluation Cycle.'
+    }
+    elseif ((jb $D 'MsiBusy') -and @(ja $D 'BusyProcesses').Count -gt 0) {
+        Add-Finding 'Medium' 'Blocked' 'Windows Installer was busy when collected' (@(ja $D 'BusyProcesses' | ForEach-Object { js $_ 'Name' }) -join ', ') 'If this persists, another install is stuck; see the processes listed and restart if needed.'
+    }
+    if (jb $D 'PendingXml.Present') {
+        Add-Finding 'Medium' 'Blocked' ('Windows servicing operations are pending (pending.xml, last written ' + (Fmt (jt $D 'PendingXml.LastWrite')) + ')') 'Component servicing is waiting for a restart to finish; new cumulative updates will not install until it completes.' 'Restart the device. If pending.xml is still there after a restart, the servicing stack is stuck: check CBS.log, then DISM /Online /Cleanup-Image /RestoreHealth.'
+    }
+
+    # Servicing / CBS
+    $cbsCount = ji $D 'CbsErrors.Count'
+    if ($cbsCount -gt 0) {
+        $codes = jdict $D 'CbsErrors.Codes'
+        $codeText = $(if ($codes -and $codes.Count -gt 0) { (@($codes.Keys | Select-Object -First 5 | ForEach-Object { $t = Get-ErrorText $_; if (-not $t) { $t = $_ }; "$t x$($codes[$_])" }) -join ' | ') } else { '' })
+        $last = ja $D 'CbsErrors.Recent' | Select-Object -Last 1
+        Add-Finding $(if ($cbsCount -ge 20) { 'High' } else { 'Medium' }) 'Servicing' ("$cbsCount servicing (CBS) error(s) in the last $($X.Days) days") ("$codeText" + $(if ($last) { ' | Latest: ' + (Short (js $last 'Message') 200) } else { '' })) (Get-FixForCodes @($(if ($codes) { $codes.Keys } else { @() })))
+    }
+
+    # WMI, certificates, scheduled cycles
+    $wmi = js $D 'WmiRepository'
+    if ($wmi -and $wmi -match 'inconsistent|not consistent') { Add-Finding 'Critical' 'WMI' 'WMI repository is inconsistent' (Short $wmi 200) 'winmgmt /salvagerepository, then repair the SCCM client (ccmsetup.exe /forceinstall).' }
+    foreach ($cert in (ja $D 'SmsCertificates')) {
+        if (jb $cert 'Expired') { Add-Finding 'High' 'SCCM client' ('SCCM client certificate expired on ' + (Fmt (jt $cert 'NotAfter'))) ((js $cert 'FriendlyName') + ' ' + (js $cert 'Subject')) 'Stop CcmExec, delete the expired certificates from the LocalMachine\SMS store, start CcmExec (it re-creates them), or renew the PKI client certificate.' }
+    }
+    foreach ($sch in (ja $D 'ClientSchedules')) {
+        $name = js $sch 'Schedule'; $last = jt $sch 'LastTriggerTime'
+        if ($name -match 'Scan|Policy|Deployment Evaluation' -and $last -and ($X.RefNow - $last).TotalDays -gt 7) {
+            Add-Finding 'Medium' 'SCCM client' ("Scheduled '$name' cycle last ran " + [int]($X.RefNow - $last).TotalDays + ' days ago') "Last run $(Fmt $last). The client's own schedule isn't firing, which points to CcmExec problems or the device being off/asleep at the scheduled times." 'Check CcmExec health and the client settings schedules; keep the device on during the maintenance window.'
+        }
+    }
+
+    # Updates paused from Settings (Windows 10/11)
+    $ux = jdict $C 'WindowsUpdate.UxSettings'
+    if ($ux) {
+        foreach ($k in @('PauseUpdatesExpiryTime', 'PauseQualityUpdatesEndTime', 'PauseFeatureUpdatesEndTime')) {
+            $until = jt $ux $k
+            if ($until -and $until -gt $X.RefNow) {
+                Add-Finding 'Medium' 'Policy' ("Updates are paused in Settings until " + (Fmt $until)) "Windows Update > Pause updates ($k) is set on the device." 'Resume updates in Settings, or block pausing with the policy "Remove access to Pause updates feature".'
+                break
+            }
+        }
+    }
+}
+
+function Invoke-AnalyzeProbe {
+    $C = $script:C
+    $P = jdict $C 'Probe'
+    if (-not $P) { return }
+    if (-not (jb $P 'Ran')) {
+        $why = js $P 'SkippedReason'
+        if ($why -and $why -notmatch 'No SCCM client') { Add-Note "Forced SCCM check-in was not run: $why." }
+        return
+    }
+    $result = js $P 'ScanResult'
+    $mins = js $P 'Minutes'
+    $failedActions = @(ja $P 'Actions' | Where-Object { -not (jb $_ 'Triggered') })
+    if ($failedActions.Count -gt 0) {
+        Add-Finding 'High' 'Forced check-in' ((Plural $failedActions.Count 'client action') + " couldn't be triggered") (@($failedActions | ForEach-Object { (js $_ 'Name') + ': ' + (Short (js $_ 'Error') 120) }) -join ' | ') 'The client is not accepting actions: repair the SCCM client (ccmrepair.exe or ccmsetup /forceinstall) and check WMI.'
+    }
+    switch ($result) {
+        'Succeeded' {
+            Add-Finding 'OK' 'Forced check-in' ('Forced check-in: update scan succeeded at ' + (Fmt (jt $P 'ScanTime'))) 'Right now the client can get policy and scan against the software update point, so the scan path is working.' 'If updates still are not installing, look at deployments, maintenance windows, restarts and install errors below.'
+        }
+        'Failed' {
+            $codes = @(ja $P 'ScanErrorCodes')
+            $codeText = @($codes | ForEach-Object { $t = Get-ErrorText $_; if ($t) { $t } else { $_ } }) -join ' | '
+            Add-Finding 'High' 'Forced check-in' ('Forced check-in: update scan FAILED' + $(if ($codes.Count) { " ($($codes -join ', '))" } else { '' })) ($codeText + ' | ' + (Short (js $P 'ScanMessage') 250)) (Get-FixForCodes $codes)
+        }
+        default {
+            Add-Finding 'High' 'Forced check-in' "Forced check-in: no update scan result within $mins minutes" "The Software Updates Scan Cycle was triggered but WUAHandler.log/ScanAgent.log recorded no completed or failed scan. The client is stuck (waiting on policy, the SUP location, or a hung Windows Update Agent)." 'Check LocationServices.log for the SUP, restart the Windows Update service and CcmExec, then trigger the scan again; if it still hangs, reset Windows Update components.'
+        }
+    }
+    $pErr = @(ja $P 'PolicyErrors')
+    if ($pErr.Count -gt 0) { Add-Finding 'High' 'Forced check-in' 'Forced check-in: policy retrieval errors' (@($pErr | ForEach-Object { Short $_ 160 }) -join ' | ') $SignatureFixes['POLICY'] }
+    elseif (-not (jb $P 'PolicyActivity')) { Add-Finding 'Medium' 'Forced check-in' 'Forced check-in: no machine policy activity was logged' 'PolicyAgent.log showed nothing after Machine Policy Retrieval was triggered.' 'Check CcmMessaging.log and LocationServices.log for management point communication.' }
+    $cErr = @(ja $P 'CommErrors')
+    if ($cErr.Count -gt 0) { Add-Finding 'High' 'Forced check-in' 'Forced check-in: communication errors with the management point' (@($cErr | ForEach-Object { Short $_ 160 }) -join ' | ') $SignatureFixes['MP_COMM'] }
+    $after = ja $P 'SoftwareCenterAfter'
+    if ($after.Count -gt 0) {
+        $states = @($after | Group-Object { $n = Get-EvalStateName (ji $_ 'EvaluationState'); if ($n) { $n } else { '?' } } | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', '
+        Add-Note ("After the forced check-in, Software Center lists " + (Plural $after.Count 'update') + ": $states.")
+    }
+    elseif ($result -eq 'Succeeded') { Add-Note ("After the forced check-in, Software Center lists no deployed updates; the client scan reports " + (js $P 'MissingAfter') + ' missing.') }
+}
+
 function Invoke-AnalyzeEvents {
     $C = $script:C; $X = $script:Ctx
     $evs = @(foreach ($e in (ja $C 'Events')) {
@@ -1742,6 +1898,10 @@ function Invoke-AnalyzeServer {
             Add-Finding 'Medium' 'SCCM client' "ConfigMgr client $clientVer is older than the site ($($script:Sms.SiteVersion))" $null 'Enable automatic client upgrade in Hierarchy Settings or push the client.'
         }
         else { Add-UpdateRow 'ConfigMgr client' $clientVer "site $($script:Sms.SiteVersion)" 'Current' 'None' 'OK' }
+    }
+    $suppress = @($v.Deployments | Where-Object { $_.Purpose -eq 'Required' -and $_.SuppressReboot -and $_.SuppressReboot -ne '0' })
+    if ($suppress.Count -gt 0 -and (jb $C 'PendingReboot.Any')) {
+        Add-Finding 'High' 'Restart' 'A restart is pending and the update deployment suppresses restarts' ("Deployments with restart suppression (SuppressReboot = 1 workstations, 2 servers, 3 both): " + (@($suppress | Select-Object -First 4 | ForEach-Object { "$($_.Name) [$($_.SuppressReboot)]" }) -join ', ') + '. Installed updates stay pending until someone restarts the device, and later updates queue behind them.') 'Schedule restarts (maintenance window + allow restart outside it, an orchestration group, or a restart task) for this collection.'
     }
     if ($v.Deployments.Count -eq 0) { Add-Finding 'High' 'SCCM server' 'No software update deployments target any collection this device is in' ("Device is in " + (Plural $v.Collections.Count 'collection') + '.') 'Add the device to a collection that receives your monthly SUG/ADR deployment.' }
     if (-not $v.LastStatusCheck) { Add-Finding 'High' 'SCCM server' 'Site has no update compliance data for this device' 'SMS_UpdateComplianceStatus has no rows: the client has never sent scan results (state messages).' "Fix the client scan first; then run 'Software Updates Scan Cycle' and check StateMessage.log." }
@@ -1861,6 +2021,58 @@ function Invoke-BuildRecentInstalls {
     foreach ($x in ($list | Sort-Object Sort -Descending | Select-Object -First 300)) { [void]$script:R.RecentInstalls.Add($x.Row) }
 }
 
+# Root-cause rules, in causal order: an earlier cause usually explains the later symptoms.
+$DiagnosisRules = @(
+    @{ Key = 'CLIENT'; Cause = 'The SCCM client is missing or broken'
+       Match = 'ConfigMgr client is not installed|CCM WMI namespace|SMS Agent Host \(CcmExec\) is|not assigned to a site|Software Updates are disabled in client settings|CCMEval health check|WMI repository|client action.* couldn.t be triggered|client certificate expired' }
+    @{ Key = 'COMM'; Cause = "The device can't talk to SCCM (management point, registration or certificates)"
+       Match = "Can't resolve|Can't connect to|management point|certificate or PKI|registration|was not found in SCCM|client as inactive|policy request|GUID doesn't match|policy retrieval errors|no machine policy activity" }
+    @{ Key = 'SCAN'; Cause = "The device can't complete a software update scan against the SUP"
+       Match = 'scan FAILED|no update scan result|update scan failures|No successful software update scan|Last successful update scan was|Group Policy is overriding|WSUS server in policy differs|WSUS policy \(WUServer|Registry\.pol|could not set the WSUS|no software update point|instead of WSUS|no update compliance data|scan result from this device' }
+    @{ Key = 'DEPLOY'; Cause = "The updates it needs aren't deployed to it"
+       Match = 'not deployed|No software update deployments|not in the SCCM catalog|but none are deployed to it' }
+    @{ Key = 'MW'; Cause = 'Installs are waiting for a maintenance window that is missing, too short or never reached'
+       Match = 'maintenance window|max run time' }
+    @{ Key = 'REBOOT'; Cause = "A restart is pending and isn't happening"
+       Match = 'Restart pending|restart is pending|restart deadline|Fast Startup|hasn''t restarted|waiting for a restart|Restart suppressed|suppresses restarts|blocked or delayed a shutdown|Updates waiting on a restart' }
+    @{ Key = 'DISK'; Cause = 'Not enough disk space (system drive, SCCM cache or EFI/Recovery partition)'
+       Match = 'GB free on|partition has only|ccmcache is only|disk or cache space|SoftwareDistribution folder is' }
+    @{ Key = 'BUSY'; Cause = 'Another installation or a stuck installer is blocking updates'
+       Match = 'installer has been running|Windows Installer was busy|Another installation was in progress|servicing operations are pending' }
+    @{ Key = 'INSTALL'; Cause = 'Updates are deployed but fail to install'
+       Match = 'install failure|installation failure|error state in Software Center|Component store corruption|servicing \(CBS\) error|MSI install failure|Update installation failures|required but not installed' }
+    @{ Key = 'POLICY'; Cause = 'Local policy or security software is blocking updates'
+       Match = 'AppLocker|Installer blocked by policy|\) is disabled|paused in Settings|deferral policies' }
+)
+
+function Invoke-BuildDiagnosis {
+    $diag = New-Object System.Collections.ArrayList
+    $relevant = @($script:R.Findings | Where-Object { @('Critical', 'High', 'Medium') -contains $_.Severity })
+    foreach ($rule in $DiagnosisRules) {
+        $hits = @($relevant | Where-Object { $_.Title -match $rule.Match })
+        if ($hits.Count -eq 0) { continue }
+        $worst = $hits | Sort-Object { Get-SevRank $_.Severity } | Select-Object -First 1
+        [void]$diag.Add([pscustomobject]@{
+                Key = $rule.Key; Severity = $worst.Severity; Cause = $rule.Cause
+                Evidence = (@($hits | Sort-Object { Get-SevRank $_.Severity } | Select-Object -First 4 | ForEach-Object { $_.Title }) -join ' | ')
+                Action = $worst.Fix
+            })
+    }
+    $winRow = $script:R.Updates | Where-Object { $_.Component -like '*cumulative update' } | Select-Object -First 1
+    $behind = ($winRow -and $winRow.Status -match 'behind')
+    if ($diag.Count -eq 0) {
+        if ($behind) {
+            [void]$diag.Add([pscustomobject]@{ Key = 'UNKNOWN'; Severity = 'Medium'; Cause = 'Behind on updates, but no blocker was found'
+                    Evidence = "$($winRow.Component): $($winRow.Status); latest $($winRow.Latest)"
+                    Action = 'Likely deployment timing: check the deployment deadline/available time and that the device is on during the maintenance window. Re-run the collector after the next deadline.' })
+        }
+        elseif ($winRow -and $winRow.Status -eq 'Current') {
+            [void]$diag.Add([pscustomobject]@{ Key = 'OK'; Severity = 'OK'; Cause = 'Up to date; no update blockers found'; Evidence = "$($winRow.Component): $($winRow.Installed)"; Action = $null })
+        }
+    }
+    foreach ($d in $diag) { [void]$script:R.Diagnosis.Add($d) }
+}
+
 function Invoke-Analysis($Data) {
     $script:C = $Data
     $script:R = [pscustomobject]@{
@@ -1870,6 +2082,7 @@ function Invoke-Analysis($Data) {
         EventGroups = (New-Object System.Collections.ArrayList); Notes = (New-Object System.Collections.ArrayList)
         Server = $null; ServerName = $null; ServerError = $null; SiteCode = $null; SiteVersion = $null
         Wsus = $null; WsusError = $null; LatestKb = $null; CuPattern = $null; MonthsBehind = 0
+        Diagnosis = (New-Object System.Collections.ArrayList)
     }
     $name = js $Data 'System.ComputerName'; if (-not $name) { $name = js $Data 'Meta.ComputerName' }
     $script:R.ComputerName = $name
@@ -1892,6 +2105,8 @@ function Invoke-Analysis($Data) {
     Invoke-Step '.NET' { Invoke-AnalyzeDotNet }
     Invoke-Step 'Windows Update' { Invoke-AnalyzeWindowsUpdate }
     Invoke-Step 'SCCM client' { Invoke-AnalyzeSccmClient }
+    Invoke-Step 'Deeper diagnostics' { Invoke-AnalyzeDiagnostics }
+    Invoke-Step 'Forced check-in' { Invoke-AnalyzeProbe }
     Invoke-Step 'Event logs' { Invoke-AnalyzeEvents }
     Invoke-Step 'Connectivity' { Invoke-AnalyzeConnectivity }
     Invoke-Step 'SCCM server' { Invoke-AnalyzeServer }
@@ -1902,6 +2117,7 @@ function Invoke-Analysis($Data) {
     if (@($script:R.Findings | Where-Object { (Get-SevRank $_.Severity) -le 1 }).Count -eq 0) {
         Add-Finding 'OK' 'Summary' 'No critical or high-severity problems found' 'Review medium/low findings below.' $null
     }
+    Invoke-Step 'Diagnosis' { Invoke-BuildDiagnosis }
     $sorted = @($script:R.Findings | Sort-Object @{ Expression = { Get-SevRank $_.Severity } }, @{ Expression = { $_.Area } })
     $script:R.Findings.Clear()
     foreach ($f in $sorted) { [void]$script:R.Findings.Add($f) }
@@ -1980,7 +2196,44 @@ function Build-Report($Res) {
     W '</div><div class="chips">'
     foreach ($s in @('Critical', 'High', 'Medium', 'Low', 'Info')) { W ("<div class=`"chip`"><b>$(Get-SevCount $Res $s)</b>$s</div>") }
     W '</div></header><main>'
-    W '<nav><a href="#updates">What needs updating</a><a href="#findings">Findings</a><a href="#missing">Missing updates</a><a href="#recent">Recent installs</a><a href="#sc">Software Center</a><a href="#client">SCCM client</a><a href="#server">SCCM server</a><a href="#wu">Windows Update</a><a href="#dotnet">.NET</a><a href="#events">Events</a><a href="#system">System</a><a href="#sources">Data sources</a></nav>'
+    W '<nav><a href="#diagnosis">Diagnosis</a><a href="#probe">Forced check-in</a><a href="#updates">What needs updating</a><a href="#findings">Findings</a><a href="#missing">Missing updates</a><a href="#recent">Recent installs</a><a href="#sc">Software Center</a><a href="#client">SCCM client</a><a href="#server">SCCM server</a><a href="#wu">Windows Update</a><a href="#dotnet">.NET</a><a href="#events">Events</a><a href="#system">System</a><a href="#sources">Data sources</a></nav>'
+
+    W '<section id="diagnosis"><h2>Most likely reason it isn''t updating</h2>'
+    if ($Res.Diagnosis.Count -eq 0) { W '<p class="muted">No diagnosis (not enough data).</p>' }
+    else {
+        $first = $Res.Diagnosis[0]
+        W ('<p style="font-size:16px">' + (Badge $first.Severity) + ' <b>' + (Enc $first.Cause) + '</b></p>')
+        if ($first.Action) { W ('<p class="fix"><b>Do this first:</b> ' + (Enc $first.Action) + '</p>') }
+        $rows = New-RowList
+        $n = 0
+        foreach ($d in $Res.Diagnosis) { $n++; $rows.Add(@([string]$n, (Badge $d.Severity), ('<b>' + (Enc $d.Cause) + '</b>'), ('<span class="small">' + (Enc $d.Evidence) + '</span>'), ('<span class="fix small">' + (Enc $d.Action) + '</span>'))) }
+        W '<h3>All contributing causes (in the order to fix them)</h3>'
+        Write-Table @('#', 'Severity', 'Cause', 'Evidence', 'Fix') $rows $null
+    }
+    W '</section>'
+
+    $P = jdict $C 'Probe'
+    if ($P -and (jb $P 'Ran')) {
+        W '<section id="probe"><h2>Forced SCCM check-in</h2>'
+        Write-KV @(
+            , @('Started', (Fmt (jt $P 'Started')))
+            , @('Finished', (Fmt (jt $P 'Finished')))
+            , @('Update scan', ((js $P 'ScanResult') + $(if (js $P 'ScanTime') { ' at ' + (Fmt (jt $P 'ScanTime')) } else { '' }) + $(if (@(ja $P 'ScanErrorCodes').Count) { ' - ' + (@(ja $P 'ScanErrorCodes') -join ', ') } else { '' })))
+            , @('Machine policy activity', $(if (jb $P 'PolicyActivity') { 'Yes' } else { 'None logged' }))
+            , @('Deployment evaluation ran', $(if (jb $P 'DeploymentEvaluated') { 'Yes' } else { 'Not seen' }))
+            , @('State messages sent', $(if (jb $P 'StateMessagesSent') { 'Yes' } else { 'Not seen' }))
+            , @('Error lines in client logs', (js $P 'ErrorCount'))
+        )
+        $rows = New-RowList
+        foreach ($a in (ja $P 'Actions')) { $rows.Add(@((Enc (js $a 'Name')), (Enc $(if (jb $a 'Triggered') { 'Triggered' } else { 'FAILED' })), (Enc (js $a 'Error')), (Enc (Fmt (jt $a 'Time'))))) }
+        Write-Table @('Action', 'Result', 'Error', 'Time') $rows $null
+        $tl = ja $P 'Timeline'
+        W "<details><summary>Client log timeline after the check-in ($($tl.Count) lines)</summary>"
+        $rows = New-RowList
+        foreach ($e in $tl) { $rows.Add(@((Enc (Fmt (jt $e 'Time'))), (Enc (js $e 'Log')), (Enc $(switch (js $e 'Type') { '3' { 'Error' } '2' { 'Warning' } default { 'Info' } })), ('<span class="mono">' + (Enc (js $e 'Message')) + '</span>'))) }
+        Write-Table @('Time', 'Log', 'Type', 'Message') $rows $null
+        W '</details></section>'
+    }
 
     W '<section id="updates"><h2>What needs to be updated</h2>'
     $rows = New-RowList
@@ -2198,6 +2451,46 @@ function Build-Report($Res) {
     Write-Table @('Query', 'Log', 'Events', 'Error') $rows 'None.'
     W '</section>'
 
+    $D = jdict $C 'Diagnostics'
+    if ($D) {
+        W '<section id="deep"><h2>Deeper diagnostics</h2><div class="grid"><div><h3>Restart blockers</h3>'
+        $fs = ji $D 'FastStartup.HiberbootEnabled'
+        Write-KV @(
+            , @('Pending restart', $(if (jb $C 'PendingReboot.Any') { @(ja $C 'PendingReboot.Reasons') -join ', ' } else { 'No' }))
+            , @('Uptime (days)', (js $C 'System.UptimeDays'))
+            , @('Fast Startup', $(if ($fs -eq 1) { 'On (Shut down does not restart Windows)' } elseif ($fs -eq 0) { 'Off' } else { 'Unknown' }))
+            , @('SCCM restart scheduled', $(if (jdict $D 'CcmRebootData') { 'Yes' } else { 'No' }))
+            , @('Console user', (js $D 'ConsoleUser'))
+            , @('Sessions', (js $D 'Sessions'))
+            , @('On battery', $(if (jb $D 'Battery.Present') { $(if (jb $D 'Battery.OnBattery') { 'Yes (' + (js $D 'Battery.ChargePercent') + '%)' } else { 'No (AC)' }) } else { 'No battery' }))
+            , @('Windows Installer busy', $(if (jb $D 'MsiBusy') { 'Yes' } else { 'No' }))
+            , @('Servicing pending (pending.xml)', $(if (jb $D 'PendingXml.Present') { 'Yes, ' + (Fmt (jt $D 'PendingXml.LastWrite')) } else { 'No' }))
+            , @('WMI repository', (js $D 'WmiRepository'))
+            , @('WinRE', (js $D 'WinRE.Status'))
+        )
+        W '<h3>Installer / servicing processes running</h3>'
+        $rows = New-RowList
+        foreach ($b in (ja $D 'BusyProcesses')) { $rows.Add(@((Enc (js $b 'Name')), (Enc (js $b 'Id')), (Enc (Fmt (jt $b 'StartTime'))), (Enc (js $b 'RunningMinutes')))) }
+        Write-Table @('Process', 'PID', 'Started', 'Running (min)') $rows 'None running.'
+        W '</div><div><h3>Volumes and partitions</h3>'
+        $rows = New-RowList
+        foreach ($vv in (ja $D 'Volumes')) { $rows.Add(@((Enc $(if (js $vv 'DriveLetter') { js $vv 'DriveLetter' } else { '(no letter)' })), (Enc (js $vv 'Label')), (Enc (js $vv 'FileSystem')), (Enc (js $vv 'CapacityMB')), (Enc (js $vv 'FreeMB')))) }
+        foreach ($pp in (ja $D 'Partitions')) { $rows.Add(@((Enc ('Disk ' + (js $pp 'Disk') + ' part ' + (js $pp 'Partition'))), (Enc (js $pp 'Type')), '', (Enc (js $pp 'SizeMB')), (Enc (js $pp 'FreeMB')))) }
+        Write-Table @('Volume', 'Label / type', 'FS', 'Size MB', 'Free MB') $rows 'No volume data.'
+        W '<h3>SCCM client schedules and certificates</h3>'
+        $rows = New-RowList
+        foreach ($sc in (ja $D 'ClientSchedules')) { $rows.Add(@((Enc (js $sc 'Schedule')), (Enc (Fmt (jt $sc 'LastTriggerTime'))))) }
+        foreach ($ce in (ja $D 'SmsCertificates')) { $rows.Add(@((Enc ('Certificate: ' + (js $ce 'FriendlyName'))), (Enc ('expires ' + (Fmt (jt $ce 'NotAfter')) + $(if (jb $ce 'Expired') { ' (EXPIRED)' } else { '' }))))) }
+        Write-Table @('Item', 'Last run / expiry') $rows 'No data.'
+        W '</div></div>'
+        $cbs = ja $D 'CbsErrors.Recent'
+        W "<details><summary>Servicing (CBS.log) errors ($($cbs.Count) shown)</summary>"
+        $rows = New-RowList
+        foreach ($e in $cbs) { $rows.Add(@((Enc (Fmt (jt $e 'Time'))), (Enc (js $e 'Component')), ('<span class="mono">' + (Enc (js $e 'Message')) + '</span>'))) }
+        Write-Table @('Time', 'Component', 'Message') $rows 'No CBS errors in the window.'
+        W '</details></section>'
+    }
+
     W '<section id="system"><h2>System</h2><div class="grid"><div>'
     $pending = $(if (jb $C 'PendingReboot.Any') { @(ja $C 'PendingReboot.Reasons') -join ', ' } else { 'No' })
     $verText = js $C 'System.DisplayVersion'; if (-not $verText) { $verText = js $C 'System.ReleaseId' }
@@ -2314,7 +2607,7 @@ function Export-AnalysisJson($Res, [string]$Path) {
     foreach ($s in @('Critical', 'High', 'Medium', 'Low', 'Info')) { $summary[$s] = Get-SevCount $Res $s }
     $doc = [ordered]@{
         ComputerName = $Res.ComputerName; CollectedAt = (Fmt $Res.CollectedAt); AnalyzedAt = (Fmt (Get-Date)); AnalyzerVersion = "PowerShell $AnalyzerVersion"
-        Summary = $summary; Updates = $Res.Updates; Findings = $Res.Findings; MissingUpdates = $Res.Missing; RecentInstalls = $Res.RecentInstalls; Notes = $Res.Notes
+        Summary = $summary; Diagnosis = $Res.Diagnosis; Updates = $Res.Updates; Findings = $Res.Findings; MissingUpdates = $Res.Missing; RecentInstalls = $Res.RecentInstalls; Notes = $Res.Notes
         MicrosoftData = [ordered]@{
             WindowsVersions = @($script:WinVersions | Where-Object { $_.Family -eq 'Client' }).Count
             WindowsReleaseBuilds = (@($script:WinReleases.Keys | Where-Object { $_ -like 'Client|*' } | ForEach-Object { $script:WinReleases[$_].Count }) | Measure-Object -Sum).Sum
@@ -2358,6 +2651,7 @@ function Get-SystemSummary($Res) {
         LatestKb   = $(if ($osRow -and $osRow.Status -ne 'Current') { $kb } else { $null })
         Support    = $(if ($verRow) { $verRow.Status } else { $null })
         DotNet     = $(if ($netBad -gt 0) { "$netBad to update" } else { 'OK' })
+        Reason     = $(if ($Res.Diagnosis.Count -gt 0) { $Res.Diagnosis[0].Cause } else { $null })
         Critical   = (Get-SevCount $Res 'Critical')
         High       = (Get-SevCount $Res 'High')
         Medium     = (Get-SevCount $Res 'Medium')
@@ -2419,17 +2713,20 @@ function Show-ResultsWindow($Results) {
     $header.Height = 30
     $header.Padding = New-Object System.Windows.Forms.Padding(8, 7, 0, 0)
     $header.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
-    $header.Text = 'Systems - select one to see what it needs and why it is not updating'
+    $header.Text = 'Systems - select one to see the most likely reason it is not updating, what it needs, and the evidence'
 
     $split = New-Object System.Windows.Forms.SplitContainer
     $split.Dock = 'Fill'
     $split.Orientation = 'Horizontal'
 
-    $sysGrid = New-Grid @('Computer', 'OS', 'Build', 'Windows updates', 'Latest KB needed', 'Support', '.NET', 'Critical', 'High', 'Medium') @(110, 150, 80, 170, 90, 140, 80, 50, 45, 50) $false
+    $sysGrid = New-Grid @('Computer', 'OS', 'Build', 'Windows updates', 'Latest KB needed', 'Most likely reason', 'Support', '.NET', 'Critical', 'High') @(100, 140, 75, 150, 80, 260, 120, 70, 45, 40) $false
     $split.Panel1.Controls.Add($sysGrid)
 
     $tabs = New-Object System.Windows.Forms.TabControl
     $tabs.Dock = 'Fill'
+    $tabDiag = New-Object System.Windows.Forms.TabPage; $tabDiag.Text = 'Diagnosis'
+    $diagGrid = New-Grid @('#', 'Severity', 'Most likely cause', 'Evidence', 'Do this') @(20, 55, 200, 300, 300) $true
+    $tabDiag.Controls.Add($diagGrid)
     $tabNeeds = New-Object System.Windows.Forms.TabPage; $tabNeeds.Text = 'What needs updating'
     $tabWhy = New-Object System.Windows.Forms.TabPage; $tabWhy.Text = 'Why it is not updating'
     $tabNotes = New-Object System.Windows.Forms.TabPage; $tabNotes.Text = 'Notes'
@@ -2439,7 +2736,7 @@ function Show-ResultsWindow($Results) {
     $notesBox.Multiline = $true; $notesBox.ReadOnly = $true; $notesBox.ScrollBars = 'Vertical'; $notesBox.Dock = 'Fill'
     $notesBox.BackColor = [System.Drawing.Color]::White
     $tabNeeds.Controls.Add($needsGrid); $tabWhy.Controls.Add($whyGrid); $tabNotes.Controls.Add($notesBox)
-    $tabs.TabPages.AddRange(@($tabNeeds, $tabWhy, $tabNotes))
+    $tabs.TabPages.AddRange(@($tabDiag, $tabNeeds, $tabWhy, $tabNotes))
     $split.Panel2.Controls.Add($tabs)
 
     $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -2454,12 +2751,12 @@ function Show-ResultsWindow($Results) {
     $btnShowAll.Padding = New-Object System.Windows.Forms.Padding(0, 6, 20, 0)
     $buttons.Controls.AddRange(@($btnClose, $btnFolder, $btnReport, $btnShowAll))
 
-    $ui.Sys = $sysGrid; $ui.Needs = $needsGrid; $ui.Why = $whyGrid; $ui.Notes = $notesBox; $ui.ShowAll = $btnShowAll; $ui.Tabs = $tabs; $ui.NeedsTab = $tabNeeds
+    $ui.Diag = $diagGrid; $ui.Sys = $sysGrid; $ui.Needs = $needsGrid; $ui.Why = $whyGrid; $ui.Notes = $notesBox; $ui.ShowAll = $btnShowAll; $ui.Tabs = $tabs; $ui.NeedsTab = $tabNeeds
     $script:Ui = $ui
 
     foreach ($res in $Results) {
         $sum = Get-SystemSummary $res
-        $i = $sysGrid.Rows.Add($sum.Computer, $sum.OS, $sum.Build, $sum.Windows, $sum.LatestKb, $sum.Support, $sum.DotNet, $sum.Critical, $sum.High, $sum.Medium)
+        $i = $sysGrid.Rows.Add($sum.Computer, $sum.OS, $sum.Build, $sum.Windows, $sum.LatestKb, $sum.Reason, $sum.Support, $sum.DotNet, $sum.Critical, $sum.High)
         $sysGrid.Rows[$i].Tag = $res
         $sysGrid.Rows[$i].DefaultCellStyle.BackColor = Get-SevColor $sum.Worst
     }
@@ -2467,10 +2764,16 @@ function Show-ResultsWindow($Results) {
     $fill = {
       try {
         $u = $script:Ui
-        $u.Needs.Rows.Clear(); $u.Why.Rows.Clear(); $u.Notes.Text = ''
+        $u.Diag.Rows.Clear(); $u.Needs.Rows.Clear(); $u.Why.Rows.Clear(); $u.Notes.Text = ''
         if ($u.Sys.SelectedRows.Count -eq 0) { return }
         $res = $u.Sys.SelectedRows[0].Tag
         if (-not $res) { return }
+        $k = 0
+        foreach ($d in $res.Diagnosis) {
+            $k++
+            $n = $u.Diag.Rows.Add([string]$k, $d.Severity, $d.Cause, $d.Evidence, $d.Action)
+            $u.Diag.Rows[$n].DefaultCellStyle.BackColor = Get-SevColor $d.Severity
+        }
         $items = @($res.Updates | Sort-Object { Get-SevRank $_.Severity })
         if (-not $u.ShowAll.Checked) { $items = @($items | Where-Object { $_.Severity -ne 'OK' }) }
         foreach ($x in $items) {

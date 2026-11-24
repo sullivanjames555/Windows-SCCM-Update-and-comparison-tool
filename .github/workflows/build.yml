@@ -80,6 +80,45 @@ jobs:
           New-SimBundle 'CLIENTSIM01' @{ ComputerName = 'CLIENTSIM01'; InstallationType = 'Client'; EditionID = 'Enterprise'; CurrentBuild = 26100; UBR = 4000; DisplayVersion = '24H2'; OSCaption = 'Microsoft Windows 11 Enterprise' }
           New-SimBundle 'SRV2016SIM' @{ ComputerName = 'SRV2016SIM'; InstallationType = 'Server'; EditionID = 'ServerStandard'; CurrentBuild = 14393; UBR = 5000; DisplayVersion = '1607'; OSCaption = 'Microsoft Windows Server 2016 Standard' }
 
+          # A troubled Windows 11 PC with an SCCM client: failed forced scan, pending restart with Fast Startup,
+          # stuck msiexec, low disk, update waiting for a maintenance window. Built by editing the JSON object.
+          Add-Type -AssemblyName System.Web.Extensions
+          $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+          $ser.MaxJsonLength = [int]::MaxValue
+          $o = $ser.DeserializeObject($json)
+          function Set-J($root, [string]$path, $value) {
+            $parts = $path.Split('.'); $cur = $root
+            for ($i = 0; $i -lt $parts.Count - 1; $i++) {
+              if (-not ($cur[$parts[$i]] -is [System.Collections.IDictionary])) { $cur[$parts[$i]] = New-Object 'System.Collections.Generic.Dictionary[string,object]' }
+              $cur = $cur[$parts[$i]]
+            }
+            $cur[$parts[-1]] = $value
+          }
+          $now = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+          $set = [ordered]@{
+            'Meta.ComputerName' = 'TROUBLEPC01'; 'System.ComputerName' = 'TROUBLEPC01'; 'System.InstallationType' = 'Client'; 'System.EditionID' = 'Enterprise'
+            'System.CurrentBuild' = 26100; 'System.UBR' = 9711; 'System.DisplayVersion' = '24H2'; 'System.OSCaption' = 'Microsoft Windows 11 Enterprise'
+            'System.SystemDriveFreeGB' = 6.5; 'System.UptimeDays' = 23
+            'PendingReboot.Any' = $true; 'PendingReboot.Reasons' = @('CBS', 'CcmClient')
+            'Sccm.Installed' = $true; 'Sccm.ServiceState' = 'Running'; 'Sccm.NamespaceOk' = $true; 'Sccm.SiteCode' = 'ABC'
+            'Sccm.ManagementPoint' = 'CM01.corp.example.com'; 'Sccm.ClientVersion' = '5.00.9135.1000'
+            'Sccm.SumConfig' = @{ ComponentEnabled = $true }; 'Sccm.UpdateSource' = @{ ContentLocation = 'http://SUP01.corp.example.com:8530' }
+            'Sccm.SoftwareCenterUpdates' = @(@{ ArticleID = '5132061'; Name = '2026-11 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems (KB5132061)'; EvaluationState = 14; ErrorCode = 0 })
+            'Sccm.LastScanFailure' = $now
+            'Sccm.LogSignatures' = @(@{ Id = 'SCAN_FAILED'; Severity = 'High'; Title = 'Software update scan failures'; Hits = 12; FirstSeen = $now; LastSeen = $now; LastLog = 'WUAHandler'; Sample = 'Scan failed with error = 0x80244022.' })
+            'WindowsUpdate.Policy.WUServer' = 'http://SUP01.corp.example.com:8530'; 'WindowsUpdate.PolicyAU.UseWUServer' = 1
+            'Diagnostics.FastStartup.HiberbootEnabled' = 1
+            'Diagnostics.BusyProcesses' = @(@{ Name = 'msiexec'; Id = 4242; StartTime = $now; RunningMinutes = 380; CpuSeconds = 2 })
+            'Diagnostics.MsiBusy' = $true
+            'Probe' = @{ Ran = $true; Started = $now; Finished = $now; Minutes = 5; ScanResult = 'Failed'; ScanTime = $now; ScanMessage = 'Scan failed with error = 0x80244022.'
+                         ScanErrorCodes = @('0x80244022'); PolicyActivity = $true; PolicyErrors = @(); CommErrors = @(); StateMessagesSent = $true; DeploymentEvaluated = $true; ErrorCount = 3
+                         Actions = @(@{ Name = 'Software Updates Scan Cycle'; Triggered = $true; Time = $now }); Timeline = @(); SoftwareCenterAfter = @(); MissingAfter = 3 }
+          }
+          foreach ($k in $set.Keys) { Set-J $o $k $set[$k] }
+          $dir = Join-Path $bundles 'UpdateHealth_TROUBLEPC01_20990101-000000'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          [IO.File]::WriteAllText("$dir\collection.json", $ser.Serialize($o))
+
           # 3. Analyzer on the whole folder; fail on any error record; then the results window self-test
           $out = Join-Path $work 'reports'
           $log = & .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath $bundles -OutputPath $out -GuiTestSeconds 3 *>&1
@@ -94,15 +133,23 @@ jobs:
             'CLIENTSIM01' = 'Windows 11 cumulative update'
             'SRV2016SIM'  = 'Windows Server 2016 cumulative update'
             $env:COMPUTERNAME = 'Windows Server 2025 cumulative update'
+            'TROUBLEPC01' = 'Windows 11 cumulative update'
           }
           $files = @(Get-ChildItem $out -Recurse -Filter analysis.json)
-          if ($files.Count -ne 3) { Write-Host "::error::expected 3 analysis.json files, found $($files.Count)"; $failed = $true }
+          if ($files.Count -ne 4) { Write-Host "::error::expected 4 analysis.json files, found $($files.Count)"; $failed = $true }
           foreach ($f in $files) {
             $a = Get-Content $f.FullName -Raw | ConvertFrom-Json
             foreach ($s in @($a.Findings | Where-Object { $_.Area -eq 'Analyzer' })) { Write-Host "::error::$($a.ComputerName): $($s.Title) - $($s.Detail)"; $failed = $true }
             $md = $a.MicrosoftData
             foreach ($k in 'WindowsVersions', 'WindowsReleaseBuilds', 'ServerVersions', 'ServerReleaseBuilds', 'DotNetChannels') {
               if (-not ($md.$k -gt 0)) { Write-Host "::error::Microsoft data not parsed: $k = $($md.$k)"; $failed = $true }
+            }
+            if (@($a.Diagnosis).Count -lt 1) { Write-Host "::error::$($a.ComputerName): no diagnosis produced"; $failed = $true }
+            else { Write-Host "   Most likely reason: [$($a.Diagnosis[0].Severity)] $($a.Diagnosis[0].Cause)"; foreach ($d in @($a.Diagnosis)) { Write-Host "     - $($d.Cause)  <=  $($d.Evidence)" } }
+            if ($a.ComputerName -eq 'TROUBLEPC01') {
+              $keys = @($a.Diagnosis | ForEach-Object { $_.Key })
+              if ($keys[0] -ne 'SCAN') { Write-Host "::error::TROUBLEPC01: expected the failed scan as the most likely reason, got $($keys[0])"; $failed = $true }
+              foreach ($k in 'SCAN', 'MW', 'REBOOT', 'BUSY', 'DISK') { if ($keys -notcontains $k) { Write-Host "::error::TROUBLEPC01: diagnosis is missing cause $k (got $($keys -join ', '))"; $failed = $true } }
             }
             $want = $expect[$a.ComputerName]
             $row = @($a.Updates | Where-Object { $_.Component -eq $want }) | Select-Object -First 1

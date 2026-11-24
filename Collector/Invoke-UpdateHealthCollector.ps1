@@ -44,6 +44,16 @@
     Skip DNS/TCP/HTTP tests to the management point and SUP.
 .PARAMETER NoZip
     Do not create a .zip of the bundle.
+.PARAMETER SkipProbe
+    Don't force an SCCM check-in. By default, when the SCCM client is installed and the script is
+    elevated, the collector triggers Machine Policy Retrieval, Software Updates Scan, Software
+    Updates Deployment Evaluation, Application Deployment Evaluation and Discovery (heartbeat),
+    re-sends update compliance state, then watches the client logs for up to -ProbeMinutes to see
+    whether the client can get policy, scan against the SUP and evaluate deployments right now.
+    The result (succeeded / failed with error / no result) is part of the analysis.
+.PARAMETER ProbeMinutes
+    How long to watch the forced check-in (1-30, default 5). It stops early once the scan has
+    finished and the deployment evaluation has had time to run.
 
 .EXAMPLE
     .\Collector\Invoke-UpdateHealthCollector.ps1
@@ -73,8 +83,9 @@
 
 .NOTES
     UpdateHealthKit 1.0.0. Requires Windows PowerShell 5.1. Read-only: it changes nothing on
-    the PC except temporarily registering (and then removing) the offline scan service when
-    -ScanCabPath is used.
+    the PC except: triggering the SCCM client's own check-in actions (same as the buttons on the
+    Configuration Manager control panel applet's Actions tab; skip with -SkipProbe), and
+    temporarily registering (then removing) the offline scan service when -ScanCabPath is used.
 #>
 [CmdletBinding()]
 param(
@@ -86,7 +97,9 @@ param(
     [switch]$IncludeWindowsUpdateLog,
     [switch]$SkipRawLogs,
     [switch]$SkipConnectivityTests,
-    [switch]$NoZip
+    [switch]$NoZip,
+    [switch]$SkipProbe,
+    [ValidateRange(1, 30)][int]$ProbeMinutes = 5
 )
 
 $ErrorActionPreference = 'Continue'
@@ -261,6 +274,34 @@ function Read-SharedText {
     }
     catch { return $null }
     finally { if ($sr) { $sr.Close() } elseif ($fs) { $fs.Close() } }
+}
+
+function Read-SharedTextFrom {
+    # Reads a shared log file from a byte offset (used to read only what was written after a point in time).
+    param([string]$Path, [long]$Offset)
+    $fs = $null; $sr = $null
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        if ($Offset -gt 0 -and $Offset -le $fs.Length) { [void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin) }
+        $sr = New-Object System.IO.StreamReader($fs)
+        return $sr.ReadToEnd()
+    }
+    catch { return $null }
+    finally { if ($sr) { $sr.Close() } elseif ($fs) { $fs.Close() } }
+}
+
+function ConvertFrom-CMLogText {
+    param([string]$Text, [string]$Log)
+    $list = New-Object System.Collections.Generic.List[object]
+    if (-not $Text) { return ,$list }
+    foreach ($m in $CMLogRegex.Matches($Text)) {
+        $dt = [datetime]::MinValue
+        $stamp = $m.Groups['date'].Value + ' ' + $m.Groups['time'].Value
+        if (-not [datetime]::TryParseExact($stamp, 'M-d-yyyy H:mm:ss', $Invariant, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { continue }
+        $list.Add([pscustomobject]@{ Log = $Log; Time = $dt; Component = $m.Groups['comp'].Value; Type = [int]$m.Groups['type'].Value; Message = $m.Groups['msg'].Value.Trim() })
+    }
+    return ,$list
 }
 
 $CMLogRegex = New-Object System.Text.RegularExpressions.Regex(
@@ -893,6 +934,16 @@ $Signatures = @(
         Pattern = '0x8004100[0-9a-fA-F]|0x80041013|WMI .{0,40}(corrupt|repository)' }
     @{ Id = 'APP_FAIL'; Severity = 'Medium'; Title = 'Software Center application install failures'; Logs = @('AppEnforce', 'AppDiscovery')
         Pattern = 'Unmatched exit code|Enforcement failed|Application .{0,120} failed' }
+    @{ Id = 'REBOOT_SUPPRESSED'; Severity = 'Medium'; Title = 'Restart suppressed or postponed'; Logs = @('RebootCoordinator', 'UpdatesDeployment', 'UpdatesHandler')
+        Pattern = 'suppress(ed|ing)? (the )?(reboot|restart)|(reboot|restart) (is )?suppressed|postpone|snooze|User (chose|selected|elected) to|reboot (will be|was) deferred' }
+    @{ Id = 'DISK_SPACE'; Severity = 'High'; Title = 'Not enough disk or cache space for downloads/installs'; Logs = @('CAS', 'ContentTransferManager', 'DataTransferService', 'UpdatesHandler', 'UpdatesDeployment', 'WUAHandler')
+        Pattern = '(not enough|insufficient) (free |disk )?(disk )?space|0x80070070|cache (is )?full|Not enough space in the cache' }
+    @{ Id = 'BUSY'; Severity = 'Medium'; Title = 'Another installation was in progress'; Logs = @('UpdatesHandler', 'UpdatesDeployment', 'AppEnforce', 'execmgr', 'WUAHandler')
+        Pattern = 'another (software update|installation|install) is (already )?in progress|0x80070652|0x80070618|waiting for (msiexec|another)|exclusive (update|install) .{0,40}in progress' }
+    @{ Id = 'MAX_RUNTIME'; Severity = 'Medium'; Title = 'Update max run time longer than the available maintenance window'; Logs = @('UpdatesDeployment', 'ServiceWindowManager', 'UpdatesHandler')
+        Pattern = 'max(imum)? ?(run ?time|execution time).{0,80}(exceed|greater|longer|not enough)|not enough time .{0,60}(window|service window)' }
+    @{ Id = 'BATTERY'; Severity = 'Low'; Title = 'Installs deferred while on battery'; Logs = @('UpdatesHandler', 'UpdatesDeployment', 'RebootCoordinator', 'AppEnforce')
+        Pattern = 'on battery|battery power' }
 )
 foreach ($s in $Signatures) { $s.Regex = New-Object System.Text.RegularExpressions.Regex($s.Pattern, $IgnoreCase) }
 
@@ -999,6 +1050,7 @@ $EventQueries = @(
     @{ Tag = 'AppLocker';     Max = 300; Filter = @{ LogName = 'Microsoft-Windows-AppLocker/EXE and DLL'; Id = 8003, 8004 } }
     @{ Tag = 'AppLocker';     Max = 300; Filter = @{ LogName = 'Microsoft-Windows-AppLocker/MSI and Script'; Id = 8006, 8007 } }
     @{ Tag = 'CodeIntegrity'; Max = 100; Filter = @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Level = 1, 2 } }
+    @{ Tag = 'RestartBlock';  Max = 100; Filter = @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-RestartManager'; Id = 10001, 10010 } }
 )
 $events = New-Object System.Collections.ArrayList
 $eventStatus = New-Object System.Collections.ArrayList
@@ -1076,6 +1128,214 @@ $Network.Connectivity = @($Connectivity)
 
 #endregion
 
+#region Deeper diagnostics ----------------------------------------------------------------
+
+Write-Step 'Deeper diagnostics (disk/partitions, restart blockers, servicing, certificates)'
+$Diag = [ordered]@{}
+try {
+    $Diag.Volumes = @(Get-CimSafe -ClassName Win32_Volume -Filter 'DriveType=3' | ForEach-Object {
+            [ordered]@{
+                DriveLetter = $_.DriveLetter; Label = $_.Label; FileSystem = $_.FileSystem
+                SystemVolume = [bool]$_.SystemVolume; BootVolume = [bool]$_.BootVolume
+                CapacityMB = [math]::Round(([double]$_.Capacity / 1MB), 0); FreeMB = [math]::Round(([double]$_.FreeSpace / 1MB), 0)
+            }
+        })
+}
+catch { Add-SectionError 'Diag.Volumes' $_ }
+try {
+    $Diag.Partitions = @(Get-Partition -ErrorAction Stop | Where-Object {
+            $_.Type -eq 'Recovery' -or $_.Type -eq 'System' -or $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -or $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+        } | ForEach-Object {
+            $vol = $null
+            try { $vol = $_ | Get-Volume -ErrorAction Stop } catch { }
+            [ordered]@{
+                Disk = $_.DiskNumber; Partition = $_.PartitionNumber; Type = [string]$_.Type
+                SizeMB = [math]::Round(([double]$_.Size / 1MB), 0)
+                FreeMB = $(if ($vol) { [math]::Round(([double]$vol.SizeRemaining / 1MB), 0) } else { $null })
+            }
+        })
+}
+catch { }
+try {
+    $re = @(& reagentc.exe /info 2>&1 | ForEach-Object { [string]$_ })
+    $Diag.WinRE = [ordered]@{ Raw = ($re -join "`n").Trim(); Status = $null }
+    $line = $re | Where-Object { $_ -match 'Windows RE status:\s*(\S+)' } | Select-Object -First 1
+    if ($line -and $line -match 'Windows RE status:\s*(\S+)') { $Diag.WinRE.Status = $Matches[1] }
+}
+catch { }
+
+# Restart blockers
+$Diag.FastStartup = [ordered]@{
+    HiberbootEnabled = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled'
+    HibernateEnabled = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled'
+}
+$bat = @(Get-CimSafe -ClassName Win32_Battery)
+if ($bat.Count -gt 0) {
+    $Diag.Battery = [ordered]@{ Present = $true; BatteryStatus = $bat[0].BatteryStatus; OnBattery = ($bat[0].BatteryStatus -eq 1); ChargePercent = $bat[0].EstimatedChargeRemaining }
+}
+else { $Diag.Battery = [ordered]@{ Present = $false } }
+try { $Diag.ConsoleUser = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
+try {
+    $qu = @(& quser.exe 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_ -notmatch 'No User exists' })
+    $Diag.Sessions = ($qu -join "`n").Trim()
+}
+catch { }
+$Diag.CcmRebootData = Get-RegValues 'HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client\Reboot Management\RebootData'
+
+# Something running that blocks installs
+$busyNames = @('msiexec', 'TiWorker', 'TrustedInstaller', 'wusa', 'DismHost', 'dism', 'setup', 'SetupHost', 'MoUsoCoreWorker', 'wuauclt', 'ccmsetup', 'WindowsUpdateBox', 'sihclient')
+$Diag.BusyProcesses = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $busyNames -contains $_.Name } | ForEach-Object {
+        $st = $null; try { $st = $_.StartTime } catch { }
+        [ordered]@{ Name = $_.Name; Id = $_.Id; StartTime = (ConvertTo-IsoDate $st); RunningMinutes = $(if ($st) { [int]($Now - $st).TotalMinutes } else { $null }); CpuSeconds = [int]$_.CPU }
+    })
+try {
+    $mtx = $null
+    $Diag.MsiBusy = [System.Threading.Mutex]::TryOpenExisting('Global\_MSIExecute', [ref]$mtx)
+    if ($mtx) { $mtx.Dispose() }
+}
+catch { $Diag.MsiBusy = $null }
+$pendingXml = Join-Path $env:windir 'WinSxS\pending.xml'
+$Diag.PendingXml = [ordered]@{ Present = (Test-Path -LiteralPath $pendingXml); LastWrite = $null }
+if ($Diag.PendingXml.Present) { $Diag.PendingXml.LastWrite = ConvertTo-IsoDate (Get-Item -LiteralPath $pendingXml -Force).LastWriteTime }
+
+# Servicing (CBS) errors in the window
+$cbsPath = Join-Path $env:windir 'Logs\CBS\CBS.log'
+$Diag.CbsErrors = [ordered]@{ Parsed = $false; Count = 0; Codes = [ordered]@{}; Recent = @() }
+if ((Test-Path -LiteralPath $cbsPath) -and (Get-Item -LiteralPath $cbsPath).Length -lt 300MB) {
+    try {
+        $cbsText = Read-SharedText $cbsPath
+        $cbsRx = New-Object System.Text.RegularExpressions.Regex('^(?<d>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}), Error\s+(?<c>\S+)\s+(?<m>.*)$', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+        $recent = New-Object System.Collections.Generic.List[object]
+        $codeCounts = @{}
+        foreach ($m in $cbsRx.Matches([string]$cbsText)) {
+            $dt = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($m.Groups['d'].Value, 'yyyy-MM-dd HH:mm:ss', $Invariant, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { continue }
+            if ($dt -lt $WindowStart) { continue }
+            $msg = $m.Groups['m'].Value.Trim(); if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }
+            $recent.Add([ordered]@{ Time = (ConvertTo-IsoDate $dt); Component = $m.Groups['c'].Value; Message = $msg })
+            foreach ($cm in $codeRegex.Matches($msg)) { $k = $cm.Value.ToUpperInvariant().Replace('0X', '0x'); if ($codeCounts.ContainsKey($k)) { $codeCounts[$k]++ } else { $codeCounts[$k] = 1 } }
+        }
+        $Diag.CbsErrors.Parsed = $true
+        $Diag.CbsErrors.Count = $recent.Count
+        foreach ($k in ($codeCounts.Keys | Sort-Object { $codeCounts[$_] } -Descending | Select-Object -First 15)) { $Diag.CbsErrors.Codes[$k] = $codeCounts[$k] }
+        $skip = [Math]::Max(0, $recent.Count - 40)
+        $Diag.CbsErrors.Recent = @($recent | Select-Object -Skip $skip)
+        $cbsText = $null
+    }
+    catch { Add-SectionError 'Diag.CBS' $_ }
+}
+
+# WMI repository, SCCM certificates, scheduled client cycles
+try { $Diag.WmiRepository = ((@(& winmgmt.exe /verifyrepository 2>&1 | ForEach-Object { [string]$_ })) -join ' ').Trim() } catch { }
+$Diag.SmsCertificates = @(Get-ChildItem -Path 'Cert:\LocalMachine\SMS' -ErrorAction SilentlyContinue | ForEach-Object {
+        [ordered]@{ Subject = $_.Subject; FriendlyName = $_.FriendlyName; NotAfter = (ConvertTo-IsoDate $_.NotAfter); Expired = ($_.NotAfter -lt $Now); HasPrivateKey = $_.HasPrivateKey }
+    })
+$ScheduleNames = @{
+    '{00000000-0000-0000-0000-000000000021}' = 'Machine Policy Retrieval'
+    '{00000000-0000-0000-0000-000000000113}' = 'Software Updates Scan'
+    '{00000000-0000-0000-0000-000000000108}' = 'Software Updates Deployment Evaluation'
+    '{00000000-0000-0000-0000-000000000121}' = 'Application Deployment Evaluation'
+    '{00000000-0000-0000-0000-000000000003}' = 'Discovery Data Collection'
+    '{00000000-0000-0000-0000-000000000001}' = 'Hardware Inventory'
+}
+if ($Sccm.Installed) {
+    $Diag.ClientSchedules = @(Get-CimSafe -Namespace 'root\ccm\Scheduler' -ClassName 'CCM_Scheduler_History' | Where-Object {
+            $ScheduleNames.ContainsKey([string]$_.ScheduleID) -and ([string]$_.UserSID -eq 'Machine' -or -not $_.UserSID)
+        } | ForEach-Object {
+            [ordered]@{ Schedule = $ScheduleNames[[string]$_.ScheduleID]; ScheduleID = [string]$_.ScheduleID; LastTriggerTime = (ConvertTo-IsoDate $_.LastTriggerTime); FirstEvalTime = (ConvertTo-IsoDate $_.FirstEvalTime) }
+        })
+}
+
+#endregion
+
+#region Forced SCCM check-in (probe) -------------------------------------------------------
+
+$Probe = [ordered]@{ Ran = $false; SkippedReason = $null }
+if ($SkipProbe) { $Probe.SkippedReason = 'Skipped with -SkipProbe' }
+elseif (-not $Sccm.Installed) { $Probe.SkippedReason = 'No SCCM client installed' }
+elseif (-not $IsAdmin) { $Probe.SkippedReason = 'Not running elevated' }
+elseif ($Sccm.NamespaceOk -eq $false) { $Probe.SkippedReason = 'CCM WMI namespace is broken' }
+else {
+    Write-Step "Forcing an SCCM check-in and watching the client logs (up to $ProbeMinutes min; use -SkipProbe to skip)"
+    $t0 = Get-Date
+    $Probe.Ran = $true
+    $Probe.Started = ConvertTo-IsoDate $t0
+    $Probe.Minutes = $ProbeMinutes
+    $watchLogs = @('WUAHandler', 'ScanAgent', 'PolicyAgent', 'PolicyEvaluator', 'CcmMessaging', 'LocationServices', 'UpdatesDeployment',
+        'UpdatesHandler', 'StateMessage', 'CAS', 'ContentTransferManager', 'DataTransferService', 'RebootCoordinator', 'ServiceWindowManager', 'ClientLocation')
+    $offsets = @{}
+    foreach ($n in $watchLogs) { $f = Join-Path $ccmLogDir "$n.log"; if (Test-Path -LiteralPath $f) { $offsets[$n] = (Get-Item -LiteralPath $f).Length } else { $offsets[$n] = 0 } }
+
+    $actionList = @(
+        @{ Name = 'Machine Policy Retrieval & Evaluation Cycle'; Id = '{00000000-0000-0000-0000-000000000021}'; Wait = 15 },
+        @{ Name = 'Software Updates Scan Cycle'; Id = '{00000000-0000-0000-0000-000000000113}'; Wait = 2 },
+        @{ Name = 'Software Updates Deployment Evaluation Cycle'; Id = '{00000000-0000-0000-0000-000000000108}'; Wait = 2 },
+        @{ Name = 'Application Deployment Evaluation Cycle'; Id = '{00000000-0000-0000-0000-000000000121}'; Wait = 2 },
+        @{ Name = 'Discovery Data Collection Cycle (heartbeat)'; Id = '{00000000-0000-0000-0000-000000000003}'; Wait = 0 }
+    )
+    $actResults = New-Object System.Collections.ArrayList
+    foreach ($a in $actionList) {
+        $err = $null
+        try { Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $a.Id } -ErrorAction Stop | Out-Null }
+        catch { $err = $_.Exception.Message }
+        [void]$actResults.Add([ordered]@{ Name = $a.Name; ScheduleId = $a.Id; Triggered = (-not $err); Error = $err; Time = (ConvertTo-IsoDate (Get-Date)) })
+        Write-Host ("    {0}: {1}" -f $a.Name, $(if ($err) { "FAILED - $err" } else { 'triggered' }))
+        if ($a.Wait -gt 0) { Start-Sleep -Seconds $a.Wait }
+    }
+    $err = $null
+    try { (New-Object -ComObject 'Microsoft.CCM.UpdatesStore').RefreshServerComplianceState() } catch { $err = $_.Exception.Message }
+    [void]$actResults.Add([ordered]@{ Name = 'Re-send update compliance state to the site'; ScheduleId = $null; Triggered = (-not $err); Error = $err; Time = (ConvertTo-IsoDate (Get-Date)) })
+    $Probe.Actions = @($actResults)
+
+    $okRx = New-Object System.Text.RegularExpressions.Regex('Successfully completed scan|Scan completed successfully', $IgnoreCase)
+    $badRx = New-Object System.Text.RegularExpressions.Regex('Scan failed with error|Scan Failed with Error|OnSearchComplete - Failed to end search job|Failed to (start|complete) scan', $IgnoreCase)
+    $deadline = $t0.AddMinutes($ProbeMinutes)
+    $timeline = New-Object System.Collections.Generic.List[object]
+    $scanDoneAt = $null
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 15
+        $timeline.Clear()
+        foreach ($n in $watchLogs) {
+            $f = Join-Path $ccmLogDir "$n.log"
+            if (-not (Test-Path -LiteralPath $f)) { continue }
+            $off = $offsets[$n]
+            if ((Get-Item -LiteralPath $f).Length -lt $off) { $off = 0 }   # log rolled over
+            foreach ($e in (ConvertFrom-CMLogText (Read-SharedTextFrom $f $off) $n)) { if ($e.Time -ge $t0.AddSeconds(-5)) { $timeline.Add($e) } }
+        }
+        $scanEvents = @($timeline | Where-Object { ($_.Log -eq 'WUAHandler' -or $_.Log -eq 'ScanAgent') -and ($okRx.IsMatch($_.Message) -or $badRx.IsMatch($_.Message)) })
+        if ($scanEvents.Count -gt 0 -and -not $scanDoneAt) { $scanDoneAt = Get-Date; Write-Host '    Scan result seen in the logs; waiting briefly for deployment evaluation...' }
+        if ($scanDoneAt -and ((Get-Date) - $scanDoneAt).TotalSeconds -ge 60) { break }
+    }
+    $Probe.Finished = ConvertTo-IsoDate (Get-Date)
+
+    $okEv = @($timeline | Where-Object { ($_.Log -eq 'WUAHandler' -or $_.Log -eq 'ScanAgent') -and $okRx.IsMatch($_.Message) } | Sort-Object Time)
+    $badEv = @($timeline | Where-Object { ($_.Log -eq 'WUAHandler' -or $_.Log -eq 'ScanAgent') -and $badRx.IsMatch($_.Message) } | Sort-Object Time)
+    $lastOk = $okEv | Select-Object -Last 1
+    $lastBad = $badEv | Select-Object -Last 1
+    if ($lastOk -and (-not $lastBad -or $lastOk.Time -ge $lastBad.Time)) { $Probe.ScanResult = 'Succeeded'; $Probe.ScanTime = ConvertTo-IsoDate $lastOk.Time }
+    elseif ($lastBad) { $Probe.ScanResult = 'Failed'; $Probe.ScanTime = ConvertTo-IsoDate $lastBad.Time; $Probe.ScanMessage = $lastBad.Message }
+    else { $Probe.ScanResult = 'NoResult' }
+    $Probe.ScanErrorCodes = @($badEv | ForEach-Object { foreach ($cm in $codeRegex.Matches($_.Message)) { $cm.Value.ToUpperInvariant().Replace('0X', '0x') } } | Select-Object -Unique)
+    $Probe.PolicyActivity = (@($timeline | Where-Object { $_.Log -eq 'PolicyAgent' }).Count -gt 0)
+    $Probe.PolicyErrors = @($timeline | Where-Object { ($_.Log -eq 'PolicyAgent' -or $_.Log -eq 'PolicyEvaluator') -and $_.Type -eq 3 } | Select-Object -Last 5 | ForEach-Object { $_.Message })
+    $Probe.CommErrors = @($timeline | Where-Object { ($_.Log -eq 'CcmMessaging' -or $_.Log -eq 'LocationServices' -or $_.Log -eq 'ClientLocation') -and $_.Type -eq 3 } | Select-Object -Last 5 | ForEach-Object { $_.Message })
+    $Probe.StateMessagesSent = (@($timeline | Where-Object { $_.Log -eq 'StateMessage' }).Count -gt 0)
+    $Probe.DeploymentEvaluated = (@($timeline | Where-Object { $_.Log -eq 'UpdatesDeployment' }).Count -gt 0)
+    $Probe.ErrorCount = @($timeline | Where-Object { $_.Type -eq 3 }).Count
+    $Probe.Timeline = @($timeline | Sort-Object Time | Select-Object -Last 300 | ForEach-Object {
+            $msg = $_.Message; if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }
+            [ordered]@{ Log = $_.Log; Time = (ConvertTo-IsoDate $_.Time); Type = $_.Type; Message = $msg }
+        })
+    $Probe.SoftwareCenterAfter = @(Get-CimSafe -Namespace 'root\ccm\ClientSDK' -ClassName 'CCM_SoftwareUpdate' | ForEach-Object {
+            ConvertFrom-CimToHash $_ -Include @('ArticleID', 'Name', 'EvaluationState', 'ErrorCode', 'PercentComplete', 'Deadline')
+        })
+    $Probe.MissingAfter = @(Get-CimSafe -Namespace 'root\ccm\SoftwareUpdates\UpdatesStore' -ClassName 'CCM_UpdateStatus' | Where-Object { $_.Status -eq 'Missing' }).Count
+    Write-Host ("    Forced check-in result: scan {0}{1}; policy activity {2}; {3} error line(s) in the client logs" -f $Probe.ScanResult,
+        $(if ($Probe.ScanErrorCodes.Count) { ' (' + ($Probe.ScanErrorCodes -join ', ') + ')' } else { '' }), $(if ($Probe.PolicyActivity) { 'yes' } else { 'none' }), $Probe.ErrorCount)
+}
+
+#endregion
+
 #region Raw log copies --------------------------------------------------------------------
 
 if (-not $SkipRawLogs) {
@@ -1145,6 +1405,8 @@ $Bundle = [ordered]@{
     DotNet         = $DotNet
     WindowsUpdate  = $WU
     Sccm           = $Sccm
+    Diagnostics    = $Diag
+    Probe          = $Probe
     Events         = @($events)
     EventLogStatus = @($eventStatus)
 }
@@ -1171,6 +1433,7 @@ Write-Host ("  Build            : {0} ({1}, {2})" -f $System.FullBuild, $System.
 Write-Host ("  SCCM client      : {0}" -f $(if ($Sccm.Installed) { "$($Sccm.ClientVersion) site $($Sccm.SiteCode), MP $($Sccm.ManagementPoint)" } else { 'not installed' }))
 Write-Host ("  Last good scan   : {0}" -f $(if ($Sccm.LastSuccessfulScan) { $Sccm.LastSuccessfulScan } else { 'none found in CCM logs' }))
 Write-Host ("  Pending reboot   : {0}" -f $(if ($Pending.Any) { ($Pending.Reasons -join ', ') } else { 'no' }))
+Write-Host ("  Forced check-in  : {0}" -f $(if ($Probe.Ran) { "scan $($Probe.ScanResult)" } else { $Probe.SkippedReason }))
 Write-Host ("  Events collected : {0}" -f $events.Count)
 Write-Host ("  Section errors   : {0}" -f $script:SectionErrors.Count)
 Write-Host "  Bundle folder    : $OutputPath"

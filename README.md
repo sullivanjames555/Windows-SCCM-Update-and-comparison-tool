@@ -48,7 +48,7 @@ cd E:\UpdateHealthKit                               # wherever you copied it (he
 .\Collector\Invoke-UpdateHealthCollector.ps1
 ```
 
-When it finishes (usually 1-3 minutes), it prints where the bundle went. The bundle is always named after the host it ran on (`UpdateHealth_<HOSTNAME>_<date-time>`), so bundles from many hosts can sit in one folder. By default it goes next to the script:
+It first gathers data, then **forces an SCCM check-in** and watches the client for up to 5 minutes. It stops early once the scan result is in. When it finishes (usually 2-7 minutes in total), it prints the check-in result and where the bundle went. The bundle is always named after the host it ran on (`UpdateHealth_<HOSTNAME>_<date-time>`), so bundles from many hosts can sit in one folder. By default it goes next to the script:
 
 ```
 E:\UpdateHealthKit\Collector\UpdateHealth_PC123_20261124-101500\       (folder)
@@ -100,7 +100,8 @@ One row per system analyzed, colored by its worst problem (red = critical, orang
 | .NET | How many .NET runtimes/SDKs need updating |
 | Critical / High / Medium | Count of findings at each severity |
 
-Select a system to see these tabs underneath:
+The **Most likely reason** column is the analyzer's diagnosis (see [How it finds the cause](#how-it-finds-the-cause)). Select a system to see these tabs underneath:
+- **Diagnosis:** every contributing cause in the order to fix them, with the evidence and what to do.
 - **What needs updating:** each component with its installed vs. latest version and the action to take.
 - **Why it is not updating:** the findings with their recommended fixes.
 - **Notes.**
@@ -218,6 +219,8 @@ Run from an **elevated** Windows PowerShell on the problem PC. All parameters ar
 | `-SkipRawLogs` | Don't copy raw CCM/CBS/DISM logs into the bundle (smaller zip) | `-SkipRawLogs` |
 | `-SkipConnectivityTests` | Skip the DNS/TCP/HTTP tests to the MP and SUP | `-SkipConnectivityTests` |
 | `-NoZip` | Leave the folder only, no zip | `-NoZip` |
+| `-SkipProbe` | Don't force the SCCM check-in (see below) | `-SkipProbe` |
+| `-ProbeMinutes` | How long to watch the forced check-in, 1-30 (default 5) | `-ProbeMinutes 10` |
 
 ### Collector examples
 
@@ -235,7 +238,18 @@ Run from an **elevated** Windows PowerShell on the problem PC. All parameters ar
 .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath \\fileserver\it\UpdateHealth
 ```
 
-The collector only reads. The one exception: with `-ScanCabPath` it registers a temporary offline scan service and removes it when the scan finishes.
+The collector changes nothing on the host except:
+- **The forced SCCM check-in** (skip with `-SkipProbe`). It triggers the client's own actions, the same as the buttons on the Configuration Manager applet's Actions tab:
+  - Machine Policy Retrieval & Evaluation
+  - Software Updates Scan
+  - Software Updates Deployment Evaluation
+  - Application Deployment Evaluation
+  - Discovery Data Collection (heartbeat)
+
+  It also re-sends update compliance state to the site.
+- **The offline scan service.** With `-ScanCabPath` it registers a temporary offline scan service and removes it when the scan finishes.
+
+It doesn't install anything, restart, or repair anything.
 
 **What it collects**
 - **System:** OS, edition, version and build.UBR, architecture (x64/ARM64/x86), model, BIOS, disk space, uptime, pending restart (CBS, WU, file renames, CCM), time sync, proxy, Secure Boot certificate status
@@ -245,6 +259,18 @@ The collector only reads. The one exception: with `-ScanCabPath` it registers a 
 - **CCM logs:** about 27 logs parsed for errors, warnings and known failure signatures (scan failures, GPO conflict, WUA source errors, content/DP problems, MP communication, certificates, registration, maintenance windows, AppLocker blocks, WMI). Raw copies are included along with ccmsetup.log, CBS.log and dism.log.
 - **Event logs:** System, Application, Setup, WindowsUpdateClient, BITS, MDM, AppLocker and CodeIntegrity
 - **Connectivity:** DNS/TCP/HTTP tests to the SUP (`/ClientWebService/client.asmx`) and the MP (`/sms_mp/.sms_aut?mplist`). When the PC is offline these fail fast and are labelled as such.
+- **Forced check-in result:** whether the client got machine policy, whether the update scan succeeded, failed (with error code) or never finished, whether deployment evaluation and state messages ran, any management point communication errors, the log timeline after the check-in, and what Software Center shows afterwards.
+- **Disk and partitions:** every volume including the EFI/System and Recovery partitions (too little room there fails updates with 0x800F0922), plus WinRE status.
+- **Restart blockers:**
+  - Fast Startup (on Windows 10/11 "Shut down" then doesn't really restart, so pending updates never finish)
+  - SCCM's restart deadline
+  - signed-in users
+  - on battery
+  - applications that blocked a shutdown (Restart Manager events)
+  - the last planned restart (event 1074)
+- **Something running that blocks installs:** installer/servicing processes and how long they've run (msiexec, TiWorker, wusa, setup, DISM, ccmsetup), whether Windows Installer is busy, and pending servicing (`pending.xml`).
+- **Servicing health:** CBS.log errors in the window with their error codes, and WMI repository consistency.
+- **SCCM client internals:** client certificate expiry, when the client's own scheduled policy, scan and evaluation cycles last ran, and whether updates were paused in Settings.
 
 ---
 
@@ -261,6 +287,27 @@ The collector only reads. The one exception: with `-ScanCabPath` it registers a 
 - **AppLocker:** a publisher rule for your signing certificate covers both scripts. Signed scripts that policy allows run in FullLanguage mode, which both scripts need (COM for the Windows Update Agent, WMI, .NET classes, and Windows Forms for the results window).
 
 ---
+
+## How it finds the cause
+
+The analyzer turns the evidence into a **diagnosis**: the most likely reason the host isn't updating, plus every other contributing cause. They're listed in the order to fix them, because an earlier cause usually explains the later symptoms:
+
+| # | Cause | Typical evidence |
+|---|---|---|
+| 1 | The SCCM client is missing or broken | No CcmExec, broken CCM WMI namespace, Software Updates disabled in client settings, CCMEval failures, inconsistent WMI repository, expired client certificate, client actions can't be triggered |
+| 2 | The device can't talk to SCCM | MP/SUP not resolvable or reachable, MP communication errors, registration/certificate errors, no policy after the forced check-in, inactive or duplicate/mismatched record on the site |
+| 3 | It can't complete an update scan | Forced scan failed (with the decoded error, e.g. 0x80244022 = SUP WSUS app pool down) or never finished; no successful scan in the logs; GPO overriding the SUP; corrupt Registry.pol; update source missing; the site has no recent scan results |
+| 4 | The needed updates aren't deployed to it | No deployments to its collections, latest CU not in the catalog / not deployed / deployed elsewhere, required updates not deployed |
+| 5 | Installs wait for a maintenance window | Software Center "waiting for service window", windows missing, too short or of the wrong type, update max run time longer than the window |
+| 6 | A restart is pending and isn't happening | Pending restart with long uptime, Fast Startup, SCCM restart deadline passed, restart suppressed by the deployment (common for servers) or postponed by users, apps blocking shutdown |
+| 7 | Not enough disk space | System drive, SCCM cache, EFI/Recovery partition, disk-space errors in the client logs |
+| 8 | Another installation is blocking it | msiexec/TiWorker running for hours, Windows Installer busy, servicing pending in `pending.xml`, "another installation is in progress" |
+| 9 | Updates are deployed but fail to install | Install failures with decoded error codes, Software Center error states, CBS servicing errors, component store corruption, required-but-not-installed on the site |
+| 10 | Policy or security software is blocking it | AppLocker/WDAC blocks of SCCM/Windows Update paths, required services disabled, updates paused in Settings, Windows Update for Business deferral/dual-scan policies |
+
+If nothing matches but the host is behind, the analyzer says so and points at deployment timing. If the host is current and has no blockers, it says it's up to date.
+
+The diagnosis appears at the top of the HTML report ("Most likely reason it isn't updating", with "Do this first"), in the results window's **Most likely reason** column and **Diagnosis** tab, and in `analysis.json`.
 
 ## What the analyzer compares against
 
@@ -312,4 +359,4 @@ The collector only reads. The one exception: with `-ScanCabPath` it registers a 
 - The Windows CU check relies on Microsoft's release-information page layout. If Microsoft changes it, the report says the data was unavailable rather than guessing.
 - For a device on hotpatch, the build number may not match the monthly B build exactly. Check the hotpatch calendar.
 - Windows Server, version 23H2 (Annual Channel) and Azure Edition hotpatch builds may not line up with the monthly B builds. Check those against the hotpatch calendar.
-- **Testing:** every push is tested on a Windows Server 2025 machine by GitHub Actions. The collector runs for real. The analyzer then processes that bundle plus two copies made to look like a Windows 11 24H2 PC and a Windows Server 2016 server, and checks that each is compared against its own OS. It also opens the results window, clicks through every system and closes it. The build fails on any error. Sample reports from each run are attached to it as `e2e-sample-reports`. The SCCM and WSUS checks can't be exercised there because there's no site to query.
+- **Testing:** every push is tested on a Windows Server 2025 machine by GitHub Actions. The collector runs for real. The analyzer then processes that bundle plus three edited copies: a Windows 11 24H2 PC, a Windows Server 2016 server, and a "troubled" Windows 11 PC. The troubled PC has a failed forced scan, a pending restart with Fast Startup on, a stuck msiexec, low disk, and an update waiting for a maintenance window. The test checks that each host is compared against its own OS, and that the troubled PC's diagnosis names the scan as the first cause and lists the others. It also opens the results window, clicks through every system and closes it. The build fails on any error. Sample reports from each run are attached to it as `e2e-sample-reports`. The SCCM and WSUS checks can't be exercised there because there's no site to query.
