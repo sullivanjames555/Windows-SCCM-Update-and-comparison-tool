@@ -11,36 +11,78 @@
     -Offline). SCCM is queried over WMI/DCOM as the current user.
 
 .PARAMETER InputPath
-    One or more collector outputs: the .zip, the bundle folder, collection.json, or a folder that
-    contains many bundles.
-.PARAMETER OutputPath
-    Where reports go. Default: .\UpdateHealthReports
+    REQUIRED. The collector's output, copied to this PC. Any of:
+      - the zip:                 C:\Bundles\UpdateHealth_PC123_20261124-101500.zip
+      - the unzipped folder:     C:\Bundles\UpdateHealth_PC123_20261124-101500
+      - collection.json inside it
+      - a folder (or share) holding many zips/folders -> one report per PC plus index.html
+      - several of the above, comma-separated
+    The collector names its output UpdateHealth_<PCNAME>_<yyyyMMdd-HHmmss> and writes it next to
+    Invoke-UpdateHealthCollector.ps1 (or %TEMP%), printing the exact path when it finishes.
+
 .PARAMETER SiteServer
-    SMS Provider (usually the primary site server) to compare against.
+    Your SCCM SMS Provider, usually the primary site server (the server the SCCM console
+    connects to). Short name or FQDN, e.g. CM01 or CM01.corp.example.com.
+    To find it: SCCM console > Administration > Site Configuration > Servers and Site System
+    Roles > the server with the "SMS Provider" role. Or confirm with:
+        Get-WmiObject -ComputerName CM01 -Namespace root\SMS -Class SMS_ProviderLocation
+    Run as an account that can open the SCCM console (Read-only Analyst is enough); the query
+    uses WMI over DCOM like the console. Leave it out to skip the SCCM-side checks.
+
 .PARAMETER SiteCode
-    Site code. Auto-detected from the SMS Provider if omitted.
+    Three-character site code, e.g. ABC. Only needed if auto-detection from -SiteServer fails.
+
 .PARAMETER WsusServer
-    Optional WSUS/SUP server to look the device up in (needs the WSUS console / RSAT
-    'Windows Server Update Services Tools' on this PC).
+    Optional WSUS server to look the device up in, usually your software update point (SUP),
+    e.g. SUP01. Needs RSAT "Windows Server Update Services Tools" on this PC.
+
 .PARAMETER WsusPort
-    WSUS port. Default 8530 (8531 for SSL).
+    WSUS port: 8530 for HTTP (default) or 8531 for HTTPS.
+
 .PARAMETER WsusSsl
-    Connect to WSUS over SSL.
+    Connect to WSUS over HTTPS (use with -WsusPort 8531).
+
+.PARAMETER OutputPath
+    Where reports are written. Default: .\UpdateHealthReports under the current folder.
+    Each PC gets <PCNAME>_<timestamp>\UpdateHealthReport.html and analysis.json.
+
 .PARAMETER Offline
-    Don't download; use cached Microsoft data only.
+    Don't download Microsoft data; use the copy cached by an earlier online run (see -CacheDir).
+    Use this on a PC without internet after copying the Analyzer folder (including cache\).
+
 .PARAMETER CacheDir
-    Cache folder for Microsoft data. Default: .\cache next to this script.
+    Cache folder for Microsoft data. Default: the cache folder next to this script.
+
 .PARAMETER CacheHours
     Re-download Microsoft data older than this many hours. Default 12.
+
 .PARAMETER Open
-    Open the report when finished.
+    Open the report (or index.html for several PCs) when finished.
 
 .EXAMPLE
-    .\Invoke-UpdateHealthAnalyzer.ps1 -InputPath E:\UpdateHealth_PC123_20261119-101500.zip -SiteServer CM01 -Open
+    .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\UpdateHealth_PC123_20261124-101500.zip -SiteServer CM01 -Open
+
+    One PC, compared with Microsoft's latest releases and the SCCM site on CM01; opens the report.
+
 .EXAMPLE
-    .\Invoke-UpdateHealthAnalyzer.ps1 -InputPath \\share\bundles -SiteServer CM01
+    .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath \\fileserver\it\UpdateHealth -SiteServer CM01.corp.example.com
+
+    Every bundle in the share: one report per PC plus a summary index.html.
+
 .EXAMPLE
-    .\Invoke-UpdateHealthAnalyzer.ps1 -InputPath .\bundle.zip -Offline
+    .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip -SiteServer CM01 -WsusServer SUP01 -WsusPort 8531 -WsusSsl
+
+    Also looks the device up in WSUS on the SUP over HTTPS.
+
+.EXAMPLE
+    .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip
+
+    No SCCM access: Microsoft comparison and collected-log checks only.
+
+.EXAMPLE
+    .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip -SiteServer CM01 -Offline
+
+    On a PC with no internet, using Microsoft data cached by an earlier online run.
 
 .NOTES
     UpdateHealthKit 1.1.0

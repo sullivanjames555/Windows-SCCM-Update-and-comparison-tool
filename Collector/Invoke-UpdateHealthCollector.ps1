@@ -44,10 +44,28 @@
     Do not create a .zip of the bundle.
 
 .EXAMPLE
-    .\Invoke-UpdateHealthCollector.ps1
+    .\Collector\Invoke-UpdateHealthCollector.ps1
+
+    Defaults: last 30 days. Writes UpdateHealth_<PC>_<timestamp>\ and a .zip of it next to this
+    script (e.g. on the USB drive), or to %TEMP% if that folder is read-only. Bring the .zip back
+    to the admin PC and run:
+        .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath <that zip> -SiteServer <primary site server>
 
 .EXAMPLE
-    .\Invoke-UpdateHealthCollector.ps1 -Days 60 -ScanCabPath E:\wsusscn2.cab -RunDismCheck
+    .\Collector\Invoke-UpdateHealthCollector.ps1 -Days 60 -RunDismCheck
+
+    60 days of history plus a read-only component store health check.
+
+.EXAMPLE
+    .\Collector\Invoke-UpdateHealthCollector.ps1 -ScanCabPath E:\wsusscn2.cab
+
+    Fully offline scan for missing security updates. Download wsusscn2.cab from Microsoft on an
+    online PC first and copy it alongside the kit.
+
+.EXAMPLE
+    .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath \\fileserver\it\UpdateHealth\PC123
+
+    Writes the bundle straight to a share the analyzer PC can read.
 
 .NOTES
     UpdateHealthKit 1.0.0. Requires Windows PowerShell 5.1. Read-only: it changes nothing on
