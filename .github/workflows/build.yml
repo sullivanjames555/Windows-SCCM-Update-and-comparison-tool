@@ -28,6 +28,28 @@ jobs:
           if ($bad) { throw "$bad PowerShell parse error(s)" }
           Write-Host 'All PowerShell scripts parse cleanly.'
 
+      - name: Unit-test SCCM AdminService query translation
+        shell: powershell
+        run: |
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1).Path, [ref]$null, [ref]$null)
+          $fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-ODataQuery' }, $true) | Select-Object -First 1
+          . ([scriptblock]::Create($fn.Extent.Text))
+          function E([string]$f) { [Uri]::EscapeDataString($f) }
+          $cases = @(
+            @("SELECT * FROM SMS_R_System WHERE Name = 'PC123'", ('SMS_R_System?$filter=' + (E "Name eq 'PC123'"))),
+            @("SELECT CollectionID, Name FROM SMS_Collection WHERE CollectionID = 'ABC00012' OR CollectionID = 'SMS00001'", ('SMS_Collection?$select=CollectionID,Name&$filter=' + (E "CollectionID eq 'ABC00012' or CollectionID eq 'SMS00001'"))),
+            @("SELECT CI_ID, ArticleID FROM SMS_SoftwareUpdate WHERE LocalizedDisplayName LIKE '%Cumulative Update for Windows 11 Version 24H2 for x64-based%' AND IsExpired = false", ('SMS_SoftwareUpdate?$select=CI_ID,ArticleID&$filter=' + (E "contains(LocalizedDisplayName,'Cumulative Update for Windows 11 Version 24H2 for x64-based') and IsExpired eq false"))),
+            @("SELECT CI_ID, Status FROM SMS_UpdateComplianceStatus WHERE MachineID = 16777220", ('SMS_UpdateComplianceStatus?$select=CI_ID,Status&$filter=' + (E 'MachineID eq 16777220'))),
+            @("SELECT * FROM SMS_R_System WHERE Name = 'O\'BRIEN-PC'", ('SMS_R_System?$filter=' + (E "Name eq 'O''BRIEN-PC'"))),
+            @("SELECT * FROM SMS_Site", 'SMS_Site')
+          )
+          $bad = 0
+          foreach ($c in $cases) {
+            $got = ConvertTo-ODataQuery $c[0]
+            if ($got -ne $c[1]) { Write-Host "::error::WQL: $($c[0])`n  expected: $($c[1])`n  got:      $got"; $bad++ } else { Write-Host "OK  $got" }
+          }
+          if ($bad) { throw "$bad query translation test(s) failed" }
+
       - name: End-to-end test (collector -> analyzer -> results window)
         shell: powershell
         run: |

@@ -142,7 +142,17 @@ Ways to find it:
 
 You usually don't need `-SiteCode`, because the analyzer reads it from the server. Pass it only if auto-detection fails, for example `-SiteCode ABC`.
 
-**Run the analyzer as an account that can open the SCCM console.** Read-only Analyst is enough. It connects over WMI/DCOM, the same way the console does, so WinRM isn't required.
+**Run the analyzer as an account that can open the SCCM console.** Read-only Analyst is enough. If you need a different account, add `-Credential (Get-Credential CORP\sccm-reader)`.
+
+**How it connects:** with the default `-SccmConnection Auto`, the analyzer tries three ways to reach the SMS Provider and uses the first that works:
+
+| Method | Port(s) from this PC to the site server | Notes |
+|---|---|---|
+| `DCOM` | TCP 135 + dynamic RPC (49152-65535) | Same as the SCCM console |
+| `WinRM` | TCP 5985 | Works when a firewall blocks RPC. WinRM is on by default on Windows Server 2012+; otherwise run `Enable-PSRemoting` on the site server |
+| `AdminService` | TCP 443 | SCCM's REST API (`https://<server>/AdminService`). This PC must trust the site server's HTTPS certificate, or add `-SkipCertificateCheck` |
+
+It prints each attempt. If all three fail, it says which of the three ports are open or blocked from this PC. To force one method, use for example `-SccmConnection WinRM`.
 
 If you leave out `-SiteServer`, the analyzer still compares the PC against Microsoft's latest Windows and .NET releases and checks everything from the collected logs. It skips only the SCCM-side checks: device record, collections, deployments, maintenance windows, and whether the latest CU is in your catalog.
 
@@ -153,6 +163,9 @@ If you leave out `-SiteServer`, the analyzer still compares the PC against Micro
 | `-InputPath` | Bundle zip/folder(s), see above (required) | `-InputPath C:\Bundles\PC123.zip` |
 | `-SiteServer` | SCCM SMS Provider / primary site server | `-SiteServer CM01` |
 | `-SiteCode` | Site code, only if auto-detect fails | `-SiteCode ABC` |
+| `-SccmConnection` | `Auto` (default), `DCOM`, `WinRM` or `AdminService` (see [how it connects](#-siteserver-how-to-find-yours)) | `-SccmConnection WinRM` |
+| `-Credential` | Query SCCM as another account | `-Credential (Get-Credential CORP\sccm-reader)` |
+| `-SkipCertificateCheck` | AdminService only: accept an untrusted HTTPS certificate | `-SkipCertificateCheck` |
 | `-WsusServer` | Also look the device up in WSUS (needs the WSUS console / RSAT "Windows Server Update Services Tools" on this PC). Usually your SUP. | `-WsusServer SUP01` |
 | `-WsusPort` | WSUS port: 8530 (HTTP, default) or 8531 (HTTPS) | `-WsusPort 8531` |
 | `-WsusSsl` | Use HTTPS to WSUS | `-WsusSsl` |
@@ -174,6 +187,10 @@ If you leave out `-SiteServer`, the analyzer still compares the PC against Micro
 
 # Also check the device in WSUS on the SUP (HTTPS)
 .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip -SiteServer CM01 -WsusServer SUP01 -WsusPort 8531 -WsusSsl
+
+# Firewall blocks RPC ("RPC server is unavailable"): use WinRM or the AdminService instead
+.\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip -SiteServer CM01 -SccmConnection WinRM
+.\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip -SiteServer CM01 -SccmConnection AdminService
 
 # No SCCM access from this PC: Microsoft comparison and log checks only
 .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath C:\Bundles\PC123.zip
@@ -282,7 +299,8 @@ The collector only reads. The one exception: with `-ScanCabPath` it registers a 
 | "running scripts is disabled on this system" | Sign the scripts (Step 1), or for testing run `Set-ExecutionPolicy -Scope Process Bypass` in that window |
 | "not digitally signed" right after downloading | You didn't **Unblock** the zip before extracting. Unblock the zip and extract again, or run `Get-ChildItem -Recurse | Unblock-File` in the folder |
 | Collector warns "Not running elevated" | Close PowerShell and reopen it with **Run as administrator** |
-| Analyzer: "Could not query the SMS Provider" / "Access denied" / "RPC server is unavailable" | Check the `-SiteServer` name. Run as an account with SCCM console rights. Make sure DCOM/WMI (TCP 135 + dynamic RPC) is open from this PC to the provider. If the site code isn't detected, pass `-SiteCode` |
+| Analyzer: **"RPC server is unavailable"** | This PC can't open DCOM/RPC to the site server. The analyzer automatically falls back to WinRM, then the AdminService, and prints a port check (135 / 5985 / 443). In order of preference: (1) run the analyzer on a PC where the SCCM console works; (2) make sure `-SiteServer` is the SMS Provider and resolves in DNS (`Resolve-DnsName CM01`); (3) use WinRM: `Test-WSMan CM01` should answer; if not, run `Enable-PSRemoting` on the site server; (4) use the AdminService over 443 (`-SccmConnection AdminService`, plus `-SkipCertificateCheck` if the cert isn't trusted); (5) ask for TCP 135 + 49152-65535 from your PC to the site server |
+| Analyzer: "Access denied" / "Could not query the SMS Provider" | Run as an account with SCCM console rights, or pass `-Credential`. If the site code isn't detected, pass `-SiteCode` |
 | Analyzer: "Microsoft Windows release data unavailable" | This PC can't reach learn.microsoft.com. Run once on a PC with internet, then copy the `Analyzer\cache` folder and use `-Offline` |
 | Analyzer: "WSUS administration API not found" | Install RSAT "Windows Server Update Services Tools" on the analyzer PC, or leave out `-WsusServer` |
 | No results window appears | It needs an interactive desktop session in Windows PowerShell (not over a remote session or scheduled task). Use the HTML report, or `-Open` |

@@ -32,6 +32,21 @@
 .PARAMETER SiteCode
     Three-character site code, e.g. ABC. Only needed if auto-detection from -SiteServer fails.
 
+.PARAMETER SccmConnection
+    How to reach the SMS Provider. Auto (default) tries, in order:
+      DCOM          like the SCCM console: TCP 135 + dynamic RPC ports
+      WinRM         PowerShell remoting / WS-Man: TCP 5985 (use when "RPC server is unavailable")
+      AdminService  SCCM REST API https://<SiteServer>/AdminService: TCP 443
+    and uses the first that works. Force one with e.g. -SccmConnection WinRM.
+
+.PARAMETER Credential
+    Account to query SCCM with, if your logged-on account has no SCCM rights or this PC is not
+    domain-joined. Example: -Credential (Get-Credential CORP\sccm-reader)
+
+.PARAMETER SkipCertificateCheck
+    AdminService only: accept the site server's HTTPS certificate even if this PC doesn't trust it
+    (e.g. the self-signed "enhanced HTTP" certificate). Prefer trusting the certificate instead.
+
 .PARAMETER WsusServer
     Optional WSUS server to look the device up in, usually your software update point (SUP),
     e.g. SUP01. Needs RSAT "Windows Server Update Services Tools" on this PC.
@@ -99,6 +114,9 @@ param(
     [string]$OutputPath,
     [string]$SiteServer,
     [string]$SiteCode,
+    [ValidateSet('Auto', 'DCOM', 'WinRM', 'AdminService')][string]$SccmConnection = 'Auto',
+    [System.Management.Automation.PSCredential]$Credential,
+    [switch]$SkipCertificateCheck,
     [string]$WsusServer,
     [int]$WsusPort = 8530,
     [switch]$WsusSsl,
@@ -736,15 +754,90 @@ function Get-NewestLts {
 
 $script:Sms = $null   # @{ Server; SiteCode; SiteVersion; Namespace; Error; Connected }
 
+# The SMS Provider can be reached three ways. -SccmConnection Auto tries them in order:
+#   DCOM          Get-WmiObject, like the SCCM console (TCP 135 + dynamic RPC ports)
+#   WinRM         CIM over WS-Man (TCP 5985), when DCOM/RPC is blocked by a firewall
+#   AdminService  SCCM REST API https://<server>/AdminService (TCP 443)
+function Invoke-AdminService([string]$Path) {
+    $url = $script:Sms.Base + $Path
+    $all = New-Object System.Collections.Generic.List[object]
+    $guard = 0
+    while ($url -and $guard -lt 500) {
+        $guard++
+        $p = @{ Uri = $url; Method = 'Get'; ErrorAction = 'Stop' }
+        if ($script:Sms.Credential) { $p.Credential = $script:Sms.Credential } else { $p.UseDefaultCredentials = $true }
+        $r = Invoke-RestMethod @p
+        if ($null -ne $r.value) { foreach ($x in @($r.value)) { $all.Add($x) } }
+        $url = $r.'@odata.nextLink'
+    }
+    return ,$all
+}
+
+function ConvertTo-ODataQuery([string]$Wql) {
+    # Translates the simple WQL used here (SELECT cols FROM Class WHERE a = 'x' OR b LIKE '%y%' AND c = 1)
+    # into an AdminService OData path: Class?$select=...&$filter=...
+    $m = [regex]::Match($Wql, '^\s*SELECT\s+(?<cols>.+?)\s+FROM\s+(?<cls>\w+)(?:\s+WHERE\s+(?<where>.+?))?\s*$', 'IgnoreCase')
+    if (-not $m.Success) { throw "Query not supported over AdminService: $Wql" }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $cols = $m.Groups['cols'].Value.Trim()
+    if ($cols -ne '*') { $parts.Add('$select=' + ((($cols -split '\s*,\s*') | ForEach-Object { $_.Trim() }) -join ',')) }
+    if ($m.Groups['where'].Success) {
+        $unq = { param([string]$q) ($q -replace "\\'", "''") -replace '\\\\', '\' }
+        $f = $m.Groups['where'].Value
+        $f = [regex]::Replace($f, "(\w+)\s+LIKE\s+'%((?:\\'|[^'])*)%'", { param($mm) "contains($($mm.Groups[1].Value),'" + (& $unq $mm.Groups[2].Value) + "')" }, 'IgnoreCase')
+        $f = [regex]::Replace($f, "(\w+)\s*=\s*('(?:\\'|[^'])*'|-?\d+|true|false)", {
+                param($mm)
+                $v = $mm.Groups[2].Value
+                if ($v.StartsWith("'")) { $v = "'" + (& $unq $v.Substring(1, $v.Length - 2)) + "'" }
+                elseif ($v -match '^(true|false)$') { $v = $v.ToLowerInvariant() }
+                "$($mm.Groups[1].Value) eq $v"
+            }, 'IgnoreCase')
+        $f = [regex]::Replace($f, '\s+OR\s+', ' or ', 'IgnoreCase')
+        $f = [regex]::Replace($f, '\s+AND\s+', ' and ', 'IgnoreCase')
+        $parts.Add('$filter=' + [Uri]::EscapeDataString($f))
+    }
+    $path = $m.Groups['cls'].Value
+    if ($parts.Count -gt 0) { $path += '?' + ($parts -join '&') }
+    return $path
+}
+
 function Invoke-SmsQuery([string]$Wql) {
-    $p = @{ ComputerName = $script:Sms.Server; Namespace = $script:Sms.Namespace; Query = $Wql; ErrorAction = 'Stop'
-            Authentication = 'PacketPrivacy'; Impersonation = 'Impersonate'; EnableAllPrivileges = $true }
-    return ,@(Get-WmiObject @p)
+    switch ($script:Sms.Mode) {
+        'WinRM' { return ,@(Get-CimInstance -CimSession $script:Sms.Cim -Namespace $script:Sms.Namespace -Query $Wql -ErrorAction Stop) }
+        'AdminService' { return ,@(Invoke-AdminService (ConvertTo-ODataQuery $Wql)) }
+        default {
+            $p = @{ ComputerName = $script:Sms.Server; Namespace = $script:Sms.Namespace; Query = $Wql; ErrorAction = 'Stop'
+                    Authentication = 'PacketPrivacy'; Impersonation = 'Impersonate'; EnableAllPrivileges = $true }
+            if ($script:Sms.Credential) { $p.Credential = $script:Sms.Credential }
+            return ,@(Get-WmiObject @p)
+        }
+    }
 }
 
 function Get-SmsProp($o, [string]$Name) {
     if ($null -eq $o) { return $null }
-    try { $v = $o.Properties[$Name].Value; return ,$v } catch { return $null }
+    try {
+        if ($o -is [System.Management.ManagementBaseObject]) { $v = $o.Properties[$Name].Value; return ,$v }
+        if ($o -is [Microsoft.Management.Infrastructure.CimInstance]) { $cp = $o.CimInstanceProperties[$Name]; if ($cp) { return ,($cp.Value) }; return $null }
+        $pp = $o.PSObject.Properties[$Name]
+        if ($pp) { return ,($pp.Value) }
+        return $null
+    }
+    catch { return $null }
+}
+
+function Get-SmsFull($o, [string]$Class, [string]$KeyProp) {
+    # Re-reads one instance so lazy properties (AssignedCIs, ServiceWindows) are filled in.
+    switch ($script:Sms.Mode) {
+        'WinRM' { try { return ,(Get-CimInstance -CimSession $script:Sms.Cim -InputObject $o -ErrorAction Stop) } catch { return ,$o } }
+        'AdminService' {
+            $k = Get-SmsProp $o $KeyProp
+            $kt = $(if ($k -is [string]) { "'" + $k.Replace("'", "''") + "'" } else { [string]$k })
+            try { $r = Invoke-AdminService ("$Class(" + [Uri]::EscapeDataString($kt) + ')'); if ($r.Count -gt 0) { return ,$r[0] } } catch { }
+            return ,$o
+        }
+        default { try { $o.Get() } catch { }; return ,$o }
+    }
 }
 
 function Get-SmsStr($o, [string]$Name) { $v = Get-SmsProp $o $Name; if ($null -eq $v) { return $null }; return [Convert]::ToString($v, $Inv) }
@@ -765,7 +858,16 @@ function ConvertFrom-WmiDate([string]$s, [bool]$AssumeUtc) {
     catch { return $null }
 }
 
-function Get-SmsDate($o, [string]$Name, [bool]$AssumeUtc) { return (ConvertFrom-WmiDate (Get-SmsStr $o $Name) $AssumeUtc) }
+function Get-SmsDate($o, [string]$Name, [bool]$AssumeUtc) {
+    $v = Get-SmsProp $o $Name
+    if ($null -eq $v) { return $null }
+    if ($v -is [datetime]) { if ($v.Year -lt 1980) { return $null }; return $v }   # WinRM/CIM already converts
+    $s = [Convert]::ToString($v, $Inv)
+    if ($s -match '^\d{14}\.') { return (ConvertFrom-WmiDate $s $AssumeUtc) }          # DCOM
+    $d = ConvertTo-DateValue $s                                                         # AdminService ISO 8601
+    if ($d -and $d.Year -lt 1980) { return $null }
+    return $d
+}
 
 function Protect-Wql([string]$s) { return ([string]$s).Replace('\', '\\').Replace("'", "\'") }
 
@@ -776,20 +878,82 @@ function Split-Batch($Items, [int]$Size) {
     return ,$out
 }
 
-function Connect-SmsProvider([string]$Server, [string]$Code) {
-    $script:Sms = @{ Server = $Server; SiteCode = $Code; SiteVersion = $null; Namespace = $null; Error = $null; Connected = $false }
+function Test-TcpPort([string]$HostName, [int]$Port, [int]$TimeoutMs = 3000) {
+    $client = New-Object System.Net.Sockets.TcpClient
     try {
-        if (-not $Code) {
-            $loc = @(Get-WmiObject -ComputerName $Server -Namespace 'root\SMS' -Class 'SMS_ProviderLocation' -Filter 'ProviderForLocalSite = true' -ErrorAction Stop -Authentication PacketPrivacy -Impersonation Impersonate)
-            if ($loc.Count -gt 0) { $script:Sms.SiteCode = [string]$loc[0].SiteCode }
-            if (-not $script:Sms.SiteCode) { $script:Sms.Error = 'Could not determine the site code from SMS_ProviderLocation. Pass -SiteCode.'; return }
-        }
-        $script:Sms.Namespace = 'root\SMS\site_' + $script:Sms.SiteCode
-        $site = @(Invoke-SmsQuery ("SELECT Version FROM SMS_Site WHERE SiteCode = '" + (Protect-Wql $script:Sms.SiteCode) + "'"))
-        if ($site.Count -gt 0) { $script:Sms.SiteVersion = [string]$site[0].Version }
-        $script:Sms.Connected = $true
+        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.EndConnect($iar); return $true }
+        return $false
     }
-    catch { $script:Sms.Error = $_.Exception.Message }
+    catch { return $false }
+    finally { $client.Close() }
+}
+
+function Connect-SmsProvider([string]$Server, [string]$Code, [string]$Mode, $Credential) {
+    $script:Sms = @{ Server = $Server; SiteCode = $Code; SiteVersion = $null; Namespace = $null; Error = $null; Connected = $false
+                     Mode = $null; Cim = $null; Base = $null; Credential = $Credential; Attempts = (New-Object System.Collections.Generic.List[string]) }
+    $modes = $(if ($Mode -and $Mode -ne 'Auto') { @($Mode) } else { @('DCOM', 'WinRM', 'AdminService') })
+    foreach ($m in $modes) {
+        $script:Sms.Mode = $m
+        $script:Sms.SiteCode = $Code
+        try {
+            switch ($m) {
+                'DCOM' {
+                    if (-not $script:Sms.SiteCode) {
+                        $p = @{ ComputerName = $Server; Namespace = 'root\SMS'; Class = 'SMS_ProviderLocation'; Filter = 'ProviderForLocalSite = true'
+                                ErrorAction = 'Stop'; Authentication = 'PacketPrivacy'; Impersonation = 'Impersonate' }
+                        if ($Credential) { $p.Credential = $Credential }
+                        $loc = @(Get-WmiObject @p)
+                        if ($loc.Count -gt 0) { $script:Sms.SiteCode = [string]$loc[0].SiteCode }
+                    }
+                }
+                'WinRM' {
+                    $p = @{ ComputerName = $Server; SessionOption = (New-CimSessionOption -Protocol Wsman); OperationTimeoutSec = 120; ErrorAction = 'Stop' }
+                    if ($Credential) { $p.Credential = $Credential }
+                    $script:Sms.Cim = New-CimSession @p
+                    if (-not $script:Sms.SiteCode) {
+                        $loc = @(Get-CimInstance -CimSession $script:Sms.Cim -Namespace 'root\SMS' -ClassName 'SMS_ProviderLocation' -Filter 'ProviderForLocalSite = true' -ErrorAction Stop)
+                        if ($loc.Count -gt 0) { $script:Sms.SiteCode = [string]$loc[0].SiteCode }
+                    }
+                }
+                'AdminService' {
+                    $script:Sms.Base = "https://$Server/AdminService/wmi/"
+                    $sites = Invoke-AdminService 'SMS_Site?$select=SiteCode,ServerName,Version,Type'
+                    if (-not $script:Sms.SiteCode) {
+                        $short = $Server.Split('.')[0]
+                        $pick = @($sites | Where-Object { [string]$_.ServerName -like "$short*" }) | Select-Object -First 1
+                        if (-not $pick) { $pick = $sites | Select-Object -First 1 }
+                        if ($pick) { $script:Sms.SiteCode = [string]$pick.SiteCode }
+                    }
+                }
+            }
+            if (-not $script:Sms.SiteCode) { throw 'Connected, but could not determine the site code. Pass -SiteCode.' }
+            $script:Sms.Namespace = 'root\SMS\site_' + $script:Sms.SiteCode
+            $site = @(Invoke-SmsQuery ("SELECT SiteCode, Version FROM SMS_Site WHERE SiteCode = '" + (Protect-Wql $script:Sms.SiteCode) + "'"))
+            if ($site.Count -gt 0) { $script:Sms.SiteVersion = Get-SmsStr $site[0] 'Version' }
+            $script:Sms.Connected = $true
+            $script:Sms.Attempts.Add("${m}: connected")
+            Write-Host "  ${m}: connected to site $($script:Sms.SiteCode) (version $($script:Sms.SiteVersion))" -ForegroundColor Green
+            return
+        }
+        catch {
+            $ex = $_.Exception; if ($ex.InnerException) { $ex = $ex.InnerException }
+            $msg = ($ex.Message -replace '\s+', ' ').Trim()
+            $script:Sms.Attempts.Add("${m}: $msg")
+            Write-Host "  ${m}: $msg" -ForegroundColor Yellow
+            if ($script:Sms.Cim) { try { Remove-CimSession $script:Sms.Cim } catch { }; $script:Sms.Cim = $null }
+        }
+    }
+    $script:Sms.Mode = $null
+    $resolves = $true
+    try { [void][System.Net.Dns]::GetHostAddresses($Server) } catch { $resolves = $false }
+    if (-not $resolves) { $ports = "the name '$Server' does not resolve in DNS from this PC" }
+    else {
+        $ports = (@(@{ P = 135; N = 'DCOM/RPC' }, @{ P = 5985; N = 'WinRM' }, @{ P = 443; N = 'AdminService' }) | ForEach-Object {
+                "$($_.P) ($($_.N)) " + $(if (Test-TcpPort $Server $_.P) { 'open' } else { 'blocked' })
+            }) -join ', '
+    }
+    $script:Sms.Error = (($script:Sms.Attempts) -join ' | ') + " || Port check from this PC to ${Server}: $ports"
 }
 
 function ConvertTo-ServerUpdate($u, $Deployed) {
@@ -836,8 +1000,14 @@ function Get-SmsDeviceView([string]$Name, [string]$CuPattern, [string]$LatestKb)
             foreach ($pn in @('ClientActiveStatus', 'ClientVersion', 'IsActive', 'IsObsolete', 'IsBlocked', 'IsApproved', 'IsClient', 'LastActiveTime',
                     'LastPolicyRequest', 'LastDDR', 'LastHardwareScan', 'LastSoftwareScan', 'LastMPServerName', 'LastClientCheckTime', 'ClientCheckPass',
                     'CNIsOnline', 'CNLastOnlineTime', 'CoManaged', 'SiteCode', 'DeviceOS', 'DeviceOSBuild')) {
-                $val = Get-SmsStr $cdr $pn
-                if ($val -and $val -match '^\d{14}\.') { $val = Fmt (ConvertFrom-WmiDate $val $true) }
+                $raw = Get-SmsProp $cdr $pn
+                $val = $null
+                if ($raw -is [datetime]) { $val = Fmt $raw }
+                elseif ($null -ne $raw) {
+                    $val = [Convert]::ToString($raw, $Inv)
+                    if ($val -match '^\d{14}\.') { $val = Fmt (ConvertFrom-WmiDate $val $true) }
+                    elseif ($pn -match '^Last.*(Time|Request|Scan|DDR)$' -or $pn -eq 'CNLastOnlineTime') { $dd = ConvertTo-DateValue $val; if ($dd) { $val = Fmt $dd } }
+                }
                 $v.Combined[$pn] = $val
             }
         }
@@ -854,7 +1024,7 @@ function Get-SmsDeviceView([string]$Name, [string]$CuPattern, [string]$LatestKb)
         foreach ($batch in (Split-Batch $colIds 20)) {
             $filter = (@($batch | ForEach-Object { "TargetCollectionID = '" + (Protect-Wql $_) + "'" }) -join ' OR ')
             foreach ($a in (Invoke-SmsQuery "SELECT * FROM SMS_UpdatesAssignment WHERE $filter")) {
-                try { $a.Get() } catch { }
+                $a = Get-SmsFull $a 'SMS_UpdatesAssignment' 'AssignmentID'
                 $count = 0
                 foreach ($x in @(Get-SmsProp $a 'AssignedCIs')) { if ($null -ne $x) { $v.DeployedCIs[[uint32]$x] = $true; $count++ } }
                 $gmt = ((Get-SmsStr $a 'UseGMTTimes') -eq 'True')
@@ -873,7 +1043,7 @@ function Get-SmsDeviceView([string]$Name, [string]$CuPattern, [string]$LatestKb)
         foreach ($batch in (Split-Batch $colIds 20)) {
             $filter = (@($batch | ForEach-Object { "CollectionID = '" + (Protect-Wql $_) + "'" }) -join ' OR ')
             foreach ($cs in (Invoke-SmsQuery "SELECT * FROM SMS_CollectionSettings WHERE $filter")) {
-                try { $cs.Get() } catch { }
+                $cs = Get-SmsFull $cs 'SMS_CollectionSettings' 'CollectionID'
                 $col = Get-SmsStr $cs 'CollectionID'
                 foreach ($sw in @(Get-SmsProp $cs 'ServiceWindows')) {
                     if ($null -eq $sw) { continue }
@@ -913,7 +1083,7 @@ function Get-SmsDeviceView([string]$Name, [string]$CuPattern, [string]$LatestKb)
         }
 
         if ($CuPattern) {
-            $v.LatestCuInCatalog = @(Invoke-SmsQuery ("SELECT CI_ID, ArticleID, LocalizedDisplayName, IsDeployed, IsSuperseded, IsExpired, DatePosted FROM SMS_SoftwareUpdate WHERE LocalizedDisplayName LIKE '%" + (Protect-Wql $CuPattern) + "%' AND IsExpired = 0") |
+            $v.LatestCuInCatalog = @(Invoke-SmsQuery ("SELECT CI_ID, ArticleID, LocalizedDisplayName, IsDeployed, IsSuperseded, IsExpired, DatePosted FROM SMS_SoftwareUpdate WHERE LocalizedDisplayName LIKE '%" + (Protect-Wql $CuPattern) + "%' AND IsExpired = false") |
                     ForEach-Object { ConvertTo-ServerUpdate $_ $v.DeployedCIs }) | Sort-Object { if ($_.DatePosted) { $_.DatePosted } else { [datetime]::MinValue } } -Descending | Select-Object -First 1
         }
         if ($LatestKb) {
@@ -1535,7 +1705,7 @@ function Invoke-AnalyzeServer {
     $script:R.ServerName = $script:Sms.Server; $script:R.SiteCode = $script:Sms.SiteCode; $script:R.SiteVersion = $script:Sms.SiteVersion
     if (-not $script:Sms.Connected) {
         $script:R.ServerError = $script:Sms.Error
-        Add-Finding 'Medium' 'SCCM server' "Could not query the SMS Provider $($script:Sms.Server)" $script:Sms.Error 'Run as an account with at least Read-only Analyst rights, check DCOM/WMI firewall rules to the provider, or pass -SiteCode.'
+        Add-Finding 'Medium' 'SCCM server' "Could not query the SMS Provider $($script:Sms.Server)" $script:Sms.Error 'Run the analyzer where the SCCM console works, or open one path from this PC to the site server: TCP 135 + dynamic RPC (DCOM), TCP 5985 (WinRM: Enable-PSRemoting on the site server) or TCP 443 (AdminService). Force one with -SccmConnection; pass -Credential for another account.'
         return
     }
     $name = $script:R.ComputerName
@@ -1921,7 +2091,7 @@ function Build-Report($Res) {
     }
     else {
         $v = $Res.Server
-        W ('<p>SMS Provider <b>' + (Enc $Res.ServerName) + '</b>, site ' + (Enc $Res.SiteCode) + ' (' + (Enc $Res.SiteVersion) + ')</p>')
+        W ('<p>SMS Provider <b>' + (Enc $Res.ServerName) + '</b>, site ' + (Enc $Res.SiteCode) + ' (' + (Enc $Res.SiteVersion) + '), connected via ' + (Enc $script:Sms.Mode) + '</p>')
         if ($v.Error) { W ('<p class="muted">Query error: ' + (Enc $v.Error) + '</p>') }
         W '<h3>Device records</h3>'
         $rows = New-RowList
@@ -2414,10 +2584,13 @@ Write-Host ("  Windows client: {0} versions / {1} release builds; Windows Server
     @($script:WinVersions | Where-Object { $_.Family -eq 'Client' }).Count, $clientRel, @($script:WinVersions | Where-Object { $_.Family -eq 'Server' }).Count, $serverRel, $script:DotNetChannels.Count)
 
 if ($SiteServer) {
-    Write-Host "Connecting to SMS Provider $SiteServer..."
-    Connect-SmsProvider $SiteServer $SiteCode
-    if ($script:Sms.Connected) { Write-Host "  Connected to site $($script:Sms.SiteCode) (version $($script:Sms.SiteVersion))" }
-    else { Write-Warning "Could not connect: $($script:Sms.Error)" }
+    Write-Host "Connecting to SMS Provider $SiteServer ($SccmConnection)..."
+    if ($SkipCertificateCheck) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+    Connect-SmsProvider $SiteServer $SiteCode $SccmConnection $Credential
+    if (-not $script:Sms.Connected) {
+        Write-Warning "Could not connect to SCCM on $SiteServer. $($script:Sms.Error)"
+        Write-Warning 'The report will still be built without the SCCM-side checks. See README > Troubleshooting > "RPC server is unavailable".'
+    }
 }
 
 $results = New-Object System.Collections.Generic.List[object]
