@@ -7,7 +7,7 @@
 .DESCRIPTION
     Run this ELEVATED on the PC that is not getting updates from Software Center / SCCM.
     It never needs internet. Copy the resulting folder or .zip to an online admin PC and run
-    UpdateHealthAnalyzer.exe against it to compare with Microsoft's latest Windows and .NET
+    Invoke-UpdateHealthAnalyzer.ps1 against it to compare with Microsoft's latest Windows and .NET
     releases and with what your SCCM/WSUS server thinks about the device.
 
     What is collected:
@@ -1153,6 +1153,6 @@ Write-Host "  Bundle folder    : $OutputPath"
 if ($zipPath) { Write-Host "  Bundle zip       : $zipPath" }
 Write-Host ''
 Write-Host 'Next: copy the zip to an online admin PC and run:' -ForegroundColor Yellow
-Write-Host '  UpdateHealthAnalyzer.exe -Input <zip or folder> -SiteServer <SMS Provider server>' -ForegroundColor Yellow
+Write-Host '  .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath <zip or folder> -SiteServer <SMS Provider server>' -ForegroundColor Yellow
 
 #endregion
