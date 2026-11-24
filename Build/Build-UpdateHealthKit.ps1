@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Compiles UpdateHealthAnalyzer.exe with the C# compiler built into .NET Framework 4.8 and
-    Authenticode-signs the analyzer and the collector script.
+    Authenticode-signs the collector and the PowerShell analyzer, and (optionally) compiles the
+    C# analyzer UpdateHealthAnalyzer.exe with the compiler built into .NET Framework 4.8.
 
 .DESCRIPTION
     No Visual Studio or SDK needed: uses %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe.
@@ -19,8 +19,8 @@
 .PARAMETER SkipSign
     Compile only.
 .PARAMETER SignOnly
-    Don't compile; just sign an existing Analyzer\UpdateHealthAnalyzer.exe and the collector
-    (use this on the unsigned build downloaded from the GitHub "latest" release).
+    Don't compile; just sign the scripts (and the .exe if present). Use this on the unsigned
+    files downloaded from the GitHub "latest" release, or when you only use the PowerShell analyzer.
 .PARAMETER CscPath
     Use a different csc.exe (e.g. Roslyn from Visual Studio Build Tools).
 
@@ -45,10 +45,10 @@ $root      = Split-Path -Parent $PSScriptRoot
 $srcDir    = Join-Path $root 'Analyzer\src'
 $outExe    = Join-Path $root 'Analyzer\UpdateHealthAnalyzer.exe'
 $collector = Join-Path $root 'Collector\Invoke-UpdateHealthCollector.ps1'
+$psAnalyzer = Join-Path $root 'Analyzer\Invoke-UpdateHealthAnalyzer.ps1'
 
 # ---- Compile -------------------------------------------------------------------------------
 if ($SignOnly) {
-    if (-not (Test-Path -LiteralPath $outExe)) { throw "$outExe not found; nothing to sign." }
     Write-Host 'Skipping compile (-SignOnly).'
 }
 else {
@@ -90,7 +90,7 @@ else {
 if (-not $cert) { throw 'No valid code-signing certificate found. Pass -Thumbprint, or use -SkipSign to compile only.' }
 Write-Host ("Signing with {0} (thumbprint {1}, expires {2:yyyy-MM-dd})" -f $cert.Subject, $cert.Thumbprint, $cert.NotAfter) -ForegroundColor Cyan
 
-$toSign = @($outExe, $collector, $PSCommandPath)
+$toSign = @($psAnalyzer, $collector, $outExe, $PSCommandPath) | Where-Object { Test-Path -LiteralPath $_ }
 foreach ($file in $toSign) {
     $sig = $null
     try {

@@ -2,24 +2,27 @@
 
 Finds out why a Windows 10/11 PC isn't getting updates from Software Center / SCCM, and what on it needs updating.
 
-It has two parts:
+It has two parts, both plain PowerShell 5.1 scripts, so nothing has to be compiled and AppLocker treats them like any other signed script:
 
 | Part | Runs on | Needs network? | What it does |
 |---|---|---|---|
-| `Collector\Invoke-UpdateHealthCollector.ps1` (PowerShell 5.1) | The problem PC | No | Collects system, .NET, Windows Update, SCCM client, CCM logs and event logs into a zip |
-| `Analyzer\UpdateHealthAnalyzer.exe` (C#, .NET Framework 4.8) | Your online admin PC | Yes (it can also use a cache) | Compares the zip with Microsoft's latest Windows/.NET releases and your SCCM site (plus WSUS if you want), then writes an HTML + JSON report |
+| `Collector\Invoke-UpdateHealthCollector.ps1` | The problem PC | No | Collects system, .NET, Windows Update, SCCM client, CCM logs and event logs into a zip |
+| `Analyzer\Invoke-UpdateHealthAnalyzer.ps1` | Your online admin PC | Yes (it can also use a cache) | Compares the zip with Microsoft's latest Windows/.NET releases and your SCCM site (plus WSUS if you want), then writes an HTML + JSON report |
+
+An optional C# build of the analyzer (`UpdateHealthAnalyzer.exe`) does the same job for places where executables are allowed; skip it if they aren't.
 
 ```
-UpdateHealthKit\
-  Build\Build-UpdateHealthKit.ps1      compile + sign
-  Collector\Invoke-UpdateHealthCollector.ps1
-  Analyzer\src\*.cs                     analyzer source (C# 5, no Visual Studio needed)
-  Analyzer\UpdateHealthAnalyzer.exe     created by the build
+Build\Build-UpdateHealthKit.ps1             sign the scripts (and optionally compile the .exe)
+Collector\Invoke-UpdateHealthCollector.ps1
+Analyzer\Invoke-UpdateHealthAnalyzer.ps1     the analyzer
+Analyzer\src\*.cs                            optional C# analyzer source
 ```
+
+Every push is tested on a Windows machine by GitHub Actions: the collector runs for real, then both analyzers process its output (plus a copy made to look like a Windows 11 client) and the build fails on any error. Sample reports from that run are attached to each Actions run as `e2e-sample-reports`.
 
 ## Download
 
-A ready-built zip containing `UpdateHealthAnalyzer.exe`, the collector, the build script and this README is on the [Latest build release](../../releases/tag/latest). GitHub Actions rebuilds it on every push to `main`. That build is **unsigned**, so sign it before using it under AppLocker:
+A ready-to-use zip with both scripts, the optional .exe, the build script and this README is on the [Latest build release](../../releases/tag/latest). GitHub Actions rebuilds it on every push to `main`. The files are **unsigned**, so sign them before using them under AppLocker:
 
 ```powershell
 # in the extracted folder (right-click the zip > Properties > Unblock first)
@@ -29,18 +32,17 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Pushing a tag such as `v1.0.0` also creates a versioned release.
 
-## 1. Build and sign yourself (optional)
+## 1. Sign (and optionally build)
 
 ```powershell
-cd UpdateHealthKit\Build
-.\Build-UpdateHealthKit.ps1                       # newest code-signing cert in CurrentUser\My
-.\Build-UpdateHealthKit.ps1 -Thumbprint <thumb>   # or pick a cert
-.\Build-UpdateHealthKit.ps1 -SkipSign             # compile only
+.\Build\Build-UpdateHealthKit.ps1 -SignOnly                     # sign the scripts only (no .exe needed)
+.\Build\Build-UpdateHealthKit.ps1 -SignOnly -Thumbprint <thumb>
+.\Build\Build-UpdateHealthKit.ps1                               # also compile UpdateHealthAnalyzer.exe, then sign
 ```
 
-The build uses `csc.exe`, which comes with .NET Framework 4.8 (`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319`). It signs the exe, the collector and the build script with SHA-256 and a timestamp. **Re-run the build after you edit any file**, because an edit breaks the signature.
+Signing uses the newest valid code-signing certificate in `CurrentUser\My` (or `-Thumbprint`), SHA-256 and a timestamp. Sign on a PC with internet so the timestamp server is reachable. **Re-sign after you edit any file**, because an edit breaks the signature.
 
-AppLocker: a publisher rule for your signing certificate covers both files. Signed scripts that are allowed by policy run in FullLanguage mode, which the collector needs for COM (Windows Update Agent) and WMI.
+AppLocker: a publisher rule for your signing certificate covers everything. Signed scripts that are allowed by policy run in FullLanguage mode, which both scripts need (COM for the Windows Update Agent, WMI, .NET classes).
 
 ## 2. Collect (on the problem PC; works offline)
 
@@ -69,11 +71,13 @@ The collector only reads. The one exception: with `-ScanCabPath` it registers a 
 ## 3. Analyze (on an online PC)
 
 ```powershell
-UpdateHealthAnalyzer.exe -Input E:\UpdateHealth_PC123_20261119-101500.zip -SiteServer CM01 -Open
-UpdateHealthAnalyzer.exe -Input \\share\bundles -SiteServer CM01            # many bundles -> index.html
-UpdateHealthAnalyzer.exe -Input bundle.zip -SiteServer CM01 -WsusServer SUP01 -WsusPort 8530
-UpdateHealthAnalyzer.exe -Input bundle.zip -Offline                          # use cached Microsoft data
+.\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath E:\UpdateHealth_PC123_20261119-101500.zip -SiteServer CM01 -Open
+.\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath \\share\bundles -SiteServer CM01        # many bundles -> index.html
+.\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath bundle.zip -SiteServer CM01 -WsusServer SUP01 -WsusPort 8530
+.\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath bundle.zip -Offline                      # use cached Microsoft data
 ```
+
+The optional exe takes the same options with `-Input` instead of `-InputPath` (`UpdateHealthAnalyzer.exe -Input bundle.zip -SiteServer CM01`).
 
 Reports are written to `.\UpdateHealthReports\<PC>_<timestamp>\UpdateHealthReport.html` and `analysis.json`.
 
@@ -89,9 +93,9 @@ Reports are written to `.\UpdateHealthReports\<PC>_<timestamp>\UpdateHealthRepor
   - client version vs. site version
 - **WSUS (optional):** the device's last report/sync time and its install summary. This needs the WSUS console (RSAT "Windows Server Update Services Tools") on the analyzer PC.
 
-Microsoft data is cached in `.\cache` next to the exe (refreshed after 12 hours; change with `-CacheHours`), so later runs work with `-Offline`.
+Microsoft data is cached in `Analyzer\cache` (refreshed after 12 hours; change with `-CacheHours`), so later runs work with `-Offline`. To analyze on a PC with no internet, run the analyzer once on an online PC and copy the `cache` folder across with it.
 
-**Permissions:** a ConfigMgr role with read access to devices, collections, deployments and software updates (Read-only Analyst works), plus DCOM/WMI access to the SMS Provider.
+**Permissions:** a ConfigMgr role with read access to devices, collections, deployments and software updates (Read-only Analyst works), plus DCOM/WMI access to the SMS Provider (the analyzer uses `Get-WmiObject` over DCOM, not WinRM).
 
 ## The report
 

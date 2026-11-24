@@ -27,11 +27,96 @@ jobs:
           if ($LASTEXITCODE -ne 2) { throw "Unexpected exit code $LASTEXITCODE from -help" }
           $global:LASTEXITCODE = 0
 
+      - name: Parse-check PowerShell scripts
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Recurse -Filter *.ps1) {
+            $tokens = $null; $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errs)
+            foreach ($e in $errs) { Write-Host "::error file=$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $bad++ }
+          }
+          if ($bad) { throw "$bad PowerShell parse error(s)" }
+          Write-Host 'All PowerShell scripts parse cleanly.'
+
+      - name: End-to-end test (collector -> both analyzers)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'e2e'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+          # 1. Real collection on this runner (Windows Server, no SCCM client)
+          $bundle = Join-Path $work 'bundle-runner'
+          & .\Collector\Invoke-UpdateHealthCollector.ps1 -OutputPath $bundle -Days 7 -NoZip
+          if (-not (Test-Path "$bundle\collection.json")) { throw 'Collector produced no collection.json' }
+
+          # 2. Same data edited to look like a Windows 11 24H2 Enterprise client, to exercise the CU comparison
+          $sim = Join-Path $work 'bundle-client-sim'
+          New-Item -ItemType Directory -Path $sim -Force | Out-Null
+          $j = [IO.File]::ReadAllText("$bundle\collection.json")
+          $j = $j -replace '("InstallationType"\s*:\s*)"[^"]*"', '$1"Client"' `
+                  -replace '("EditionID"\s*:\s*)"[^"]*"', '$1"Enterprise"' `
+                  -replace '("CurrentBuild"\s*:\s*)\d+', '${1}26100' `
+                  -replace '("UBR"\s*:\s*)\d+', '${1}4000' `
+                  -replace '("DisplayVersion"\s*:\s*)(null|"[^"]*")', '$1"24H2"' `
+                  -replace '("ComputerName"\s*:\s*)"[^"]*"', '$1"CLIENTSIM01"'
+          [IO.File]::WriteAllText("$sim\collection.json", $j)
+
+          $script:failed = $false
+          function Test-Analysis([string]$Dir, [string]$Label) {
+            $files = @(Get-ChildItem $Dir -Recurse -Filter analysis.json)
+            if ($files.Count -ne 2) { Write-Host "::error::${Label}: expected 2 analysis.json files, found $($files.Count)"; $script:failed = $true; return }
+            foreach ($f in $files) {
+              $a = Get-Content $f.FullName -Raw | ConvertFrom-Json
+              foreach ($s in @($a.Findings | Where-Object { $_.Area -eq 'Analyzer' })) { Write-Host "::error::$Label $($a.ComputerName): $($s.Title) - $($s.Detail)"; $script:failed = $true }
+              $md = $a.MicrosoftData
+              if ($md.WindowsVersions -lt 1 -or $md.WindowsReleaseBuilds -lt 1 -or $md.DotNetChannels -lt 1) { Write-Host "::error::$Label Microsoft data not parsed: $($md | ConvertTo-Json -Compress)"; $script:failed = $true }
+              if ($a.ComputerName -eq 'CLIENTSIM01') {
+                $row = @($a.Updates | Where-Object { $_.Component -eq 'Windows 11 cumulative update' }) | Select-Object -First 1
+                if (-not $row -or $row.Status -eq 'Not checked') { Write-Host "::error::$Label client-sim: Windows 11 CU comparison did not run"; $script:failed = $true }
+                else { Write-Host "$Label client-sim CU row: $($row.Installed) -> $($row.Latest) [$($row.Status)]" }
+              }
+              Write-Host "$Label $($a.ComputerName): $($a.Summary | ConvertTo-Json -Compress) | MS data $($md | ConvertTo-Json -Compress)"
+              foreach ($u in $a.Updates) { Write-Host "   $($u.Severity) | $($u.Component) | $($u.Installed) -> $($u.Latest) | $($u.Status)" }
+            }
+          }
+
+          # 3. PowerShell analyzer: fail on any error record it writes
+          $psOut = Join-Path $work 'reports-powershell'
+          $log = & .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath $bundle, $sim -OutputPath $psOut 2>&1
+          $psExit = $LASTEXITCODE
+          $log | ForEach-Object { Write-Host $_ }
+          $psErrors = @($log | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+          foreach ($e in $psErrors) { Write-Host "::error::PowerShell analyzer: $($e.Exception.Message) $($e.InvocationInfo.PositionMessage)"; $script:failed = $true }
+          if ($psExit) { Write-Host "::error::PowerShell analyzer exit code $psExit"; $script:failed = $true }
+          Test-Analysis $psOut 'PowerShell'
+
+          # 4. C# analyzer
+          $exeOut = Join-Path $work 'reports-exe'
+          $ErrorActionPreference = 'Continue'
+          & .\Analyzer\UpdateHealthAnalyzer.exe -Input $bundle -Input $sim -Output $exeOut
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::exe analyzer exit code $LASTEXITCODE"; $script:failed = $true }
+          Test-Analysis $exeOut 'exe'
+
+          Copy-Item $psOut, $exeOut -Destination (New-Item -ItemType Directory -Path .\e2e-reports -Force) -Recurse
+          $global:LASTEXITCODE = 0
+          if ($script:failed) { throw 'End-to-end test failed (see errors above).' }
+
+      - name: Upload sample reports from the end-to-end test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-sample-reports
+          path: e2e-reports
+          if-no-files-found: ignore
+
       - name: Package
         shell: powershell
         run: |
           $stage = Join-Path $env:RUNNER_TEMP 'UpdateHealthKit'
           New-Item -ItemType Directory -Path "$stage\Analyzer", "$stage\Collector", "$stage\Build" -Force | Out-Null
+          Copy-Item .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 "$stage\Analyzer\"
           Copy-Item .\Analyzer\UpdateHealthAnalyzer.exe "$stage\Analyzer\"
           Copy-Item .\Collector\Invoke-UpdateHealthCollector.ps1 "$stage\Collector\"
           Copy-Item .\Build\Build-UpdateHealthKit.ps1 "$stage\Build\"

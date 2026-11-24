@@ -52,6 +52,9 @@ namespace UpdateHealthKit
         public string WsusError;
         public string LatestKb;
         public string CuPattern;
+        public int MsWindowsVersions;
+        public int MsWindowsReleaseBuilds;
+        public int MsDotNetChannels;
 
         public int Count(string sev) { return Findings.Count(f => f.Severity == sev); }
 
@@ -79,6 +82,10 @@ namespace UpdateHealthKit
             d["MissingUpdates"] = Missing;
             d["RecentInstalls"] = RecentInstalls;
             d["Notes"] = Notes;
+            d["MicrosoftData"] = new Dictionary<string, object>
+            {
+                { "WindowsVersions", MsWindowsVersions }, { "WindowsReleaseBuilds", MsWindowsReleaseBuilds }, { "DotNetChannels", MsDotNetChannels }
+            };
             if (Server != null)
             {
                 d["SccmServer"] = new Dictionary<string, object>
@@ -137,6 +144,9 @@ namespace UpdateHealthKit
             arch = J.S(c, "System.UpdateArch") ?? "x64";
             sccmInstalled = J.B(c, "Sccm.Installed");
             likelyOffline = J.B(c, "Meta.LikelyOffline");
+            r.MsWindowsVersions = ms.Windows.Versions.Count;
+            r.MsWindowsReleaseBuilds = ms.Windows.Releases.Values.Sum(x => x.Count);
+            r.MsDotNetChannels = ms.DotNet.Channels.Count;
 
             Step("Collection", AnalyzeMeta);
             Step("Windows", AnalyzeWindows);
@@ -216,7 +226,14 @@ namespace UpdateHealthKit
             bool ltsc = Regex.IsMatch(edition, @"Enterprise(S|SN)$", RegexOptions.IgnoreCase);
             bool entClass = Regex.IsMatch(edition, "Enterprise|Education|ServerRdsh", RegexOptions.IgnoreCase);
             string installedBuild = build + "." + ubr;
+            string instType = J.S(c, "System.InstallationType") ?? "";
 
+            if (instType.IndexOf("Server", StringComparison.OrdinalIgnoreCase) >= 0 || edition.StartsWith("Server", StringComparison.OrdinalIgnoreCase))
+            {
+                Row("Windows Server cumulative update", installedBuild, "not compared", "Not checked", "Windows Server isn't covered by the Microsoft comparison; use the SCCM server view", Sev.Info);
+                r.Notes.Add("This is Windows Server (" + edition + "). The Microsoft client release comparison was skipped; SCCM, log and event checks still apply.");
+                return;
+            }
             if (!string.IsNullOrEmpty(disp))
                 r.CuPattern = string.Format(CultureInfo.InvariantCulture, "Cumulative Update for {0} Version {1} for {2}-based", product, disp, arch);
 
