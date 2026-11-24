@@ -60,7 +60,7 @@ jobs:
 
           # 3. Analyzer on the whole folder; fail on any error record; then the results window self-test
           $out = Join-Path $work 'reports'
-          $log = & .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath $bundles -OutputPath $out -GuiTestSeconds 3 2>&1
+          $log = & .\Analyzer\Invoke-UpdateHealthAnalyzer.ps1 -InputPath $bundles -OutputPath $out -GuiTestSeconds 3 *>&1
           $exit = $LASTEXITCODE
           $log | ForEach-Object { Write-Host $_ }
           $failed = $false
