@@ -235,6 +235,11 @@ function ja($o, [string]$p) {
     return ,$list
 }
 
+# jae: same as ja but writes the items one by one, for use in pipelines and @(...).
+# (ja returns the list as ONE object so that assignments keep it a list; piping or @()-wrapping
+#  that single object would hand the whole list over as one item.)
+function jae($o, [string]$p) { foreach ($x in (ja $o $p)) { $x } }
+
 function jdict($o, [string]$p) {
     $v = jget $o $p
     if ($v -is [System.Collections.IDictionary]) { return ,$v }
@@ -400,10 +405,9 @@ function Get-ErrorText($v) {
 }
 
 function Find-ErrorCodes([string]$text) {
-    $out = New-Object System.Collections.Generic.List[string]
-    if (-not $text) { return ,$out }
-    foreach ($m in [regex]::Matches($text, '0x[0-9A-Fa-f]{8}')) { $out.Add('0x' + $m.Value.Substring(2).ToUpperInvariant()) }
-    return ,$out
+    # Writes each 0xXXXXXXXX code found in the text (enumerated, so it pipes naturally).
+    if (-not $text) { return }
+    foreach ($m in [regex]::Matches($text, '0x[0-9A-Fa-f]{8}')) { '0x' + $m.Value.Substring(2).ToUpperInvariant() }
 }
 
 function Get-FixForCodes($codes) {
@@ -808,13 +812,13 @@ function ConvertTo-ODataQuery([string]$Wql) {
 
 function Invoke-SmsQuery([string]$Wql) {
     switch ($script:Sms.Mode) {
-        'WinRM' { return ,@(Get-CimInstance -CimSession $script:Sms.Cim -Namespace $script:Sms.Namespace -Query $Wql -ErrorAction Stop) }
-        'AdminService' { return ,@(Invoke-AdminService (ConvertTo-ODataQuery $Wql)) }
+        'WinRM' { return (Get-CimInstance -CimSession $script:Sms.Cim -Namespace $script:Sms.Namespace -Query $Wql -ErrorAction Stop) }
+        'AdminService' { foreach ($x in (Invoke-AdminService (ConvertTo-ODataQuery $Wql))) { $x }; return }
         default {
             $p = @{ ComputerName = $script:Sms.Server; Namespace = $script:Sms.Namespace; Query = $Wql; ErrorAction = 'Stop'
                     Authentication = 'PacketPrivacy'; Impersonation = 'Impersonate'; EnableAllPrivileges = $true }
             if ($script:Sms.Credential) { $p.Credential = $script:Sms.Credential }
-            return ,@(Get-WmiObject @p)
+            return (Get-WmiObject @p)
         }
     }
 }
@@ -1031,7 +1035,7 @@ function Get-SmsDeviceView([string]$Name, [string]$CuPattern, [string]$LatestKb)
             foreach ($a in (Invoke-SmsQuery "SELECT * FROM SMS_UpdatesAssignment WHERE $filter")) {
                 $a = Get-SmsFull $a 'SMS_UpdatesAssignment' 'AssignmentID'
                 $count = 0
-                foreach ($x in @(Get-SmsProp $a 'AssignedCIs')) { if ($null -ne $x) { $v.DeployedCIs[[uint32]$x] = $true; $count++ } }
+                foreach ($x in (Get-SmsProp $a 'AssignedCIs')) { if ($null -ne $x) { $v.DeployedCIs[[uint32]$x] = $true; $count++ } }
                 $gmt = ((Get-SmsStr $a 'UseGMTTimes') -eq 'True')
                 $deadline = Fmt (Get-SmsDate $a 'EnforcementDeadline' $gmt)
                 $col = Get-SmsStr $a 'TargetCollectionID'
@@ -1050,7 +1054,7 @@ function Get-SmsDeviceView([string]$Name, [string]$CuPattern, [string]$LatestKb)
             foreach ($cs in (Invoke-SmsQuery "SELECT * FROM SMS_CollectionSettings WHERE $filter")) {
                 $cs = Get-SmsFull $cs 'SMS_CollectionSettings' 'CollectionID'
                 $col = Get-SmsStr $cs 'CollectionID'
-                foreach ($sw in @(Get-SmsProp $cs 'ServiceWindows')) {
+                foreach ($sw in (Get-SmsProp $cs 'ServiceWindows')) {
                     if ($null -eq $sw) { continue }
                     $gmt = ((Get-SmsStr $sw 'IsGMT') -eq 'True')
                     $colName = $col; if ($col -and $names.ContainsKey($col)) { $colName = $names[$col] }
@@ -1480,7 +1484,7 @@ function Invoke-AnalyzeWindowsUpdate {
     $up = jd $C 'System.UptimeDays'
     if (jb $C 'PendingReboot.Any') {
         $u = $(if ($null -ne $up) { $up } else { 0 })
-        $reasons = @(ja $C 'PendingReboot.Reasons') -join ', '
+        $reasons = @(jae $C 'PendingReboot.Reasons') -join ', '
         Add-Finding $(if ($u -gt 7) { 'High' } else { 'Medium' }) 'Restart' "Restart pending ($reasons)" ("Uptime " + $u.ToString('0.#', $Inv) + " days. Windows and SCCM won't install further updates until the pending restart completes.") "Restart the device. If it keeps coming back, check deployments with 'Suppress restart' and the RebootCoordinator.log."
     }
     elseif ($null -ne $up -and $up -gt 30) {
@@ -1600,7 +1604,7 @@ function Invoke-AnalyzeSccmClient {
         $summary = @($scu | Group-Object { $n = Get-EvalStateName (ji $_ 'EvaluationState'); if ($n) { $n } else { '?' } } | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', '
         Add-Note ("Software Center shows " + (Plural $scu.Count 'deployed update') + ": $summary.")
     }
-    $clientMissing = @(ja $C 'Sccm.UpdateStatus' | Where-Object { (js $_ 'Status') -eq 'Missing' }).Count
+    $clientMissing = @(jae $C 'Sccm.UpdateStatus' | Where-Object { (js $_ 'Status') -eq 'Missing' }).Count
     if ($clientMissing -gt 0 -and $scu.Count -eq 0) {
         Add-Finding 'Medium' 'SCCM client' ("Client scan reports " + (Plural $clientMissing 'missing update') + ' but none are deployed to it') "CCM_UpdateStatus lists them as Missing, yet Software Center has no update deployments." "Deploy the needed software update groups to a collection containing this device (see SCCM server view), or check that the device is in the expected collections."
     }
@@ -1617,12 +1621,12 @@ function Invoke-AnalyzeSccmClient {
         Add-Finding 'Low' 'SCCM client' ("ccmcache is only " + ($cacheMb / 1024).ToString('0.#', $Inv) + ' GB') 'Feature updates and large cumulative updates can exceed a small cache.' 'Raise the client cache size in client settings (10-25 GB is common).'
     }
     $evalSummary = js $C 'Sccm.CcmEval.Summary'
-    $failedChecks = @(ja $C 'Sccm.CcmEval.Checks' | Where-Object { $res = [string](js $_ 'Result'); $res.Length -gt 0 -and $res -ne 'Passed' -and $res -ne 'Not Applicable' })
+    $failedChecks = @(jae $C 'Sccm.CcmEval.Checks' | Where-Object { $res = [string](js $_ 'Result'); $res.Length -gt 0 -and $res -ne 'Passed' -and $res -ne 'Not Applicable' })
     if ($failedChecks.Count -gt 0 -or ($evalSummary -and $evalSummary -ne 'Passed')) {
         $t = $(if ($evalSummary) { $evalSummary } else { 'failures' })
         Add-Finding 'High' 'SCCM client' "CCMEval health check: $t" (@($failedChecks | Select-Object -First 8 | ForEach-Object { (Short (js $_ 'Description') 80) + ' = ' + (js $_ 'Result') }) -join ' | ') 'Review CcmEval.log; repair the client (ccmrepair.exe or ccmsetup /forceinstall).'
     }
-    $failedApps = @(ja $C 'Sccm.Applications' | Where-Object { $e = jl $_ 'ErrorCode'; $null -ne $e -and $e -ne 0 })
+    $failedApps = @(jae $C 'Sccm.Applications' | Where-Object { $e = jl $_ 'ErrorCode'; $null -ne $e -and $e -ne 0 })
     if ($failedApps.Count -gt 0) {
         Add-Finding 'Medium' 'Software Center' ((Plural $failedApps.Count 'application') + ' with install errors in Software Center') (@($failedApps | Select-Object -First 8 | ForEach-Object { $t = Get-ErrorText (js $_ 'ErrorCode'); if (-not $t) { $t = js $_ 'ErrorCode' }; (js $_ 'Name') + ": $t" }) -join ' | ') $SignatureFixes['APP_FAIL']
     }
@@ -1687,21 +1691,21 @@ function Invoke-AnalyzeDiagnostics {
     if ($pending -and ($sessions -or $consoleUser)) {
         Add-Note ('Users signed in while a restart is pending: ' + $(if ($consoleUser) { "$consoleUser (console)" } else { '' }) + $(if ($sessions) { '; sessions: ' + (Short $sessions 200) } else { '' }) + '. SCCM waits for or prompts these users before restarting.')
     }
-    $rbEvents = @(ja $C 'Events' | Where-Object { (js $_ 'Tag') -eq 'RestartBlock' })
+    $rbEvents = @(jae $C 'Events' | Where-Object { (js $_ 'Tag') -eq 'RestartBlock' })
     if ($rbEvents.Count -gt 0) {
         Add-Finding 'Medium' 'Restart' ((Plural $rbEvents.Count 'application') + ' blocked or delayed a shutdown/restart (Restart Manager)') (@($rbEvents | Select-Object -First 4 | ForEach-Object { Short (js $_ 'Message') 160 }) -join ' | ') 'Close or update the listed applications; consider forcing restarts in the deployment once users have been notified.'
     }
-    $lastRestart = @(ja $C 'Events' | Where-Object { (ji $_ 'Id') -eq 1074 } | Sort-Object { [string](js $_ 'Time') } -Descending) | Select-Object -First 1
+    $lastRestart = @(jae $C 'Events' | Where-Object { (ji $_ 'Id') -eq 1074 } | Sort-Object { [string](js $_ 'Time') } -Descending) | Select-Object -First 1
     if ($lastRestart) { Add-Note ('Last planned restart/shutdown (event 1074) at ' + (Fmt (jt $lastRestart 'Time')) + ': ' + (Short (js $lastRestart 'Message') 220)) }
 
     # Something running that blocks installs
-    $stuck = @(ja $D 'BusyProcesses' | Where-Object { (jl $_ 'RunningMinutes') -ge 120 -and @('msiexec', 'TiWorker', 'wusa', 'DismHost', 'dism', 'setup', 'SetupHost', 'ccmsetup') -contains (js $_ 'Name') })
+    $stuck = @(jae $D 'BusyProcesses' | Where-Object { (jl $_ 'RunningMinutes') -ge 120 -and @('msiexec', 'TiWorker', 'wusa', 'DismHost', 'dism', 'setup', 'SetupHost', 'ccmsetup') -contains (js $_ 'Name') })
     if ($stuck.Count -gt 0) {
         $list = @($stuck | ForEach-Object { (js $_ 'Name') + ' (PID ' + (js $_ 'Id') + ', running ' + [math]::Round((jl $_ 'RunningMinutes') / 60, 1) + ' h)' }) -join ', '
         Add-Finding 'High' 'Blocked' "An installer has been running for hours: $list" 'Windows Installer and the servicing stack run one install at a time. A hung installer makes every update and application install wait or fail (0x80070652 "another installation is already in progress").' 'Find what launched it (parent process / AppEnforce.log), end it or restart the device, then trigger the Software Updates Deployment Evaluation Cycle.'
     }
-    elseif ((jb $D 'MsiBusy') -and @(ja $D 'BusyProcesses').Count -gt 0) {
-        Add-Finding 'Medium' 'Blocked' 'Windows Installer was busy when collected' (@(ja $D 'BusyProcesses' | ForEach-Object { js $_ 'Name' }) -join ', ') 'If this persists, another install is stuck; see the processes listed and restart if needed.'
+    elseif ((jb $D 'MsiBusy') -and @(jae $D 'BusyProcesses').Count -gt 0) {
+        Add-Finding 'Medium' 'Blocked' 'Windows Installer was busy when collected' (@(jae $D 'BusyProcesses' | ForEach-Object { js $_ 'Name' }) -join ', ') 'If this persists, another install is stuck; see the processes listed and restart if needed.'
     }
     if (jb $D 'PendingXml.Present') {
         Add-Finding 'Medium' 'Blocked' ('Windows servicing operations are pending (pending.xml, last written ' + (Fmt (jt $D 'PendingXml.LastWrite')) + ')') 'Component servicing is waiting for a restart to finish; new cumulative updates will not install until it completes.' 'Restart the device. If pending.xml is still there after a restart, the servicing stack is stuck: check CBS.log, then DISM /Online /Cleanup-Image /RestoreHealth.'
@@ -1712,7 +1716,7 @@ function Invoke-AnalyzeDiagnostics {
     if ($cbsCount -gt 0) {
         $codes = jdict $D 'CbsErrors.Codes'
         $codeText = $(if ($codes -and $codes.Count -gt 0) { (@($codes.Keys | Select-Object -First 5 | ForEach-Object { $t = Get-ErrorText $_; if (-not $t) { $t = $_ }; "$t x$($codes[$_])" }) -join ' | ') } else { '' })
-        $last = ja $D 'CbsErrors.Recent' | Select-Object -Last 1
+        $last = jae $D 'CbsErrors.Recent' | Select-Object -Last 1
         Add-Finding $(if ($cbsCount -ge 20) { 'High' } else { 'Medium' }) 'Servicing' ("$cbsCount servicing (CBS) error(s) in the last $($X.Days) days") ("$codeText" + $(if ($last) { ' | Latest: ' + (Short (js $last 'Message') 200) } else { '' })) (Get-FixForCodes @($(if ($codes) { $codes.Keys } else { @() })))
     }
 
@@ -1753,7 +1757,7 @@ function Invoke-AnalyzeProbe {
     }
     $result = js $P 'ScanResult'
     $mins = js $P 'Minutes'
-    $failedActions = @(ja $P 'Actions' | Where-Object { -not (jb $_ 'Triggered') })
+    $failedActions = @(jae $P 'Actions' | Where-Object { -not (jb $_ 'Triggered') })
     if ($failedActions.Count -gt 0) {
         Add-Finding 'High' 'Forced check-in' ((Plural $failedActions.Count 'client action') + " couldn't be triggered") (@($failedActions | ForEach-Object { (js $_ 'Name') + ': ' + (Short (js $_ 'Error') 120) }) -join ' | ') 'The client is not accepting actions: repair the SCCM client (ccmrepair.exe or ccmsetup /forceinstall) and check WMI.'
     }
@@ -1762,7 +1766,7 @@ function Invoke-AnalyzeProbe {
             Add-Finding 'OK' 'Forced check-in' ('Forced check-in: update scan succeeded at ' + (Fmt (jt $P 'ScanTime'))) 'Right now the client can get policy and scan against the software update point, so the scan path is working.' 'If updates still are not installing, look at deployments, maintenance windows, restarts and install errors below.'
         }
         'Failed' {
-            $codes = @(ja $P 'ScanErrorCodes')
+            $codes = @(jae $P 'ScanErrorCodes')
             $codeText = @($codes | ForEach-Object { $t = Get-ErrorText $_; if ($t) { $t } else { $_ } }) -join ' | '
             Add-Finding 'High' 'Forced check-in' ('Forced check-in: update scan FAILED' + $(if ($codes.Count) { " ($($codes -join ', '))" } else { '' })) ($codeText + ' | ' + (Short (js $P 'ScanMessage') 250)) (Get-FixForCodes $codes)
         }
@@ -1770,10 +1774,10 @@ function Invoke-AnalyzeProbe {
             Add-Finding 'High' 'Forced check-in' "Forced check-in: no update scan result within $mins minutes" "The Software Updates Scan Cycle was triggered but WUAHandler.log/ScanAgent.log recorded no completed or failed scan. The client is stuck (waiting on policy, the SUP location, or a hung Windows Update Agent)." 'Check LocationServices.log for the SUP, restart the Windows Update service and CcmExec, then trigger the scan again; if it still hangs, reset Windows Update components.'
         }
     }
-    $pErr = @(ja $P 'PolicyErrors')
+    $pErr = @(jae $P 'PolicyErrors')
     if ($pErr.Count -gt 0) { Add-Finding 'High' 'Forced check-in' 'Forced check-in: policy retrieval errors' (@($pErr | ForEach-Object { Short $_ 160 }) -join ' | ') $SignatureFixes['POLICY'] }
     elseif (-not (jb $P 'PolicyActivity')) { Add-Finding 'Medium' 'Forced check-in' 'Forced check-in: no machine policy activity was logged' 'PolicyAgent.log showed nothing after Machine Policy Retrieval was triggered.' 'Check CcmMessaging.log and LocationServices.log for management point communication.' }
-    $cErr = @(ja $P 'CommErrors')
+    $cErr = @(jae $P 'CommErrors')
     if ($cErr.Count -gt 0) { Add-Finding 'High' 'Forced check-in' 'Forced check-in: communication errors with the management point' (@($cErr | ForEach-Object { Short $_ 160 }) -join ' | ') $SignatureFixes['MP_COMM'] }
     $after = ja $P 'SoftwareCenterAfter'
     if ($after.Count -gt 0) {
@@ -2218,7 +2222,7 @@ function Build-Report($Res) {
         Write-KV @(
             , @('Started', (Fmt (jt $P 'Started')))
             , @('Finished', (Fmt (jt $P 'Finished')))
-            , @('Update scan', ((js $P 'ScanResult') + $(if (js $P 'ScanTime') { ' at ' + (Fmt (jt $P 'ScanTime')) } else { '' }) + $(if (@(ja $P 'ScanErrorCodes').Count) { ' - ' + (@(ja $P 'ScanErrorCodes') -join ', ') } else { '' })))
+            , @('Update scan', ((js $P 'ScanResult') + $(if (js $P 'ScanTime') { ' at ' + (Fmt (jt $P 'ScanTime')) } else { '' }) + $(if (@(jae $P 'ScanErrorCodes').Count) { ' - ' + (@(jae $P 'ScanErrorCodes') -join ', ') } else { '' })))
             , @('Machine policy activity', $(if (jb $P 'PolicyActivity') { 'Yes' } else { 'None logged' }))
             , @('Deployment evaluation ran', $(if (jb $P 'DeploymentEvaluated') { 'Yes' } else { 'Not seen' }))
             , @('State messages sent', $(if (jb $P 'StateMessagesSent') { 'Yes' } else { 'Not seen' }))
@@ -2273,7 +2277,7 @@ function Build-Report($Res) {
     Write-Table @('KB', 'Name', 'State', 'Error', 'Deadline', 'Progress') $rows 'No software updates are deployed to this device in Software Center.'
     W '<h3>Applications</h3>'
     $rows = New-RowList
-    foreach ($a in (ja $C 'Sccm.Applications' | Sort-Object { [string](js $_ 'LastInstallTime') } -Descending)) {
+    foreach ($a in (jae $C 'Sccm.Applications' | Sort-Object { [string](js $_ 'LastInstallTime') } -Descending)) {
         $rows.Add(@((Enc (js $a 'Name')), (Enc (js $a 'SoftwareVersion')), (Enc (js $a 'InstallState')), (Enc (Fmt (jt $a 'LastInstallTime'))), (Enc (Get-ErrorText (js $a 'ErrorCode'))), (Enc $(if (jb $a 'IsMachineTarget') { 'Device' } else { 'User' }))))
     }
     Write-Table @('Name', 'Version', 'Install state', 'Last install', 'Error', 'Target') $rows 'No applications.'
@@ -2313,7 +2317,7 @@ function Build-Report($Res) {
 
     W '<h3>Known failure signatures in CCM logs</h3>'
     $rows = New-RowList
-    foreach ($s in (ja $C 'Sccm.LogSignatures' | Sort-Object { Get-SevRank (js $_ 'Severity') })) {
+    foreach ($s in (jae $C 'Sccm.LogSignatures' | Sort-Object { Get-SevRank (js $_ 'Severity') })) {
         $hits = js $s 'Hits'; if (-not $hits) { $hits = js $s 'Count' }
         $rows.Add(@((Badge (js $s 'Severity')), (Enc (js $s 'Title')), (Enc $hits), (Enc (Fmt (jt $s 'FirstSeen'))), (Enc (Fmt (jt $s 'LastSeen'))), (Enc (js $s 'LastLog')), ('<span class="mono">' + (Enc (js $s 'Sample')) + '</span>')))
     }
@@ -2326,7 +2330,7 @@ function Build-Report($Res) {
     $rows = New-RowList
     foreach ($l in (ja $C 'Sccm.LogsParsed')) { $rows.Add(@((Enc (js $l 'Log')), (Enc (js $l 'Entries')), (Enc (js $l 'Errors')), (Enc (js $l 'Warnings')))) }
     Write-Table @('Log', 'Entries', 'Errors', 'Warnings') $rows 'No CCM logs parsed.'
-    foreach ($grp in (ja $C 'Sccm.LogEntries' | Group-Object { $lg = js $_ 'Log'; if ($lg) { $lg } else { '?' } } | Sort-Object Name)) {
+    foreach ($grp in (jae $C 'Sccm.LogEntries' | Group-Object { $lg = js $_ 'Log'; if ($lg) { $lg } else { '?' } } | Sort-Object Name)) {
         W ('<details><summary>' + (Enc $grp.Name) + ".log - $($grp.Count) entries</summary>")
         $rows = New-RowList
         foreach ($e in ($grp.Group | Sort-Object { [string](js $_ 'Time') } -Descending)) {
@@ -2435,7 +2439,7 @@ function Build-Report($Res) {
     $rows = New-RowList
     foreach ($g in $Res.EventGroups) { $rows.Add(@((Enc $g.Log), (Enc $g.Provider), (Enc $g.Id), (Enc $g.Count), (Enc $g.Last), ('<span class="small">' + (Enc $g.Sample) + '</span>'))) }
     Write-Table @('Log', 'Source', 'ID', 'Count', 'Last', 'Sample') $rows 'No error events in the window.'
-    foreach ($grp in (ja $C 'Events' | Group-Object { $tg = js $_ 'Tag'; if ($tg) { $tg } else { '?' } } | Sort-Object Name)) {
+    foreach ($grp in (jae $C 'Events' | Group-Object { $tg = js $_ 'Tag'; if ($tg) { $tg } else { '?' } } | Sort-Object Name)) {
         W ('<details><summary>' + (Enc $grp.Name) + " - $($grp.Count) events</summary>")
         $rows = New-RowList
         foreach ($e in ($grp.Group | Sort-Object { [string](js $_ 'Time') } -Descending | Select-Object -First 300)) {
@@ -2456,7 +2460,7 @@ function Build-Report($Res) {
         W '<section id="deep"><h2>Deeper diagnostics</h2><div class="grid"><div><h3>Restart blockers</h3>'
         $fs = ji $D 'FastStartup.HiberbootEnabled'
         Write-KV @(
-            , @('Pending restart', $(if (jb $C 'PendingReboot.Any') { @(ja $C 'PendingReboot.Reasons') -join ', ' } else { 'No' }))
+            , @('Pending restart', $(if (jb $C 'PendingReboot.Any') { @(jae $C 'PendingReboot.Reasons') -join ', ' } else { 'No' }))
             , @('Uptime (days)', (js $C 'System.UptimeDays'))
             , @('Fast Startup', $(if ($fs -eq 1) { 'On (Shut down does not restart Windows)' } elseif ($fs -eq 0) { 'Off' } else { 'Unknown' }))
             , @('SCCM restart scheduled', $(if (jdict $D 'CcmRebootData') { 'Yes' } else { 'No' }))
@@ -2492,7 +2496,7 @@ function Build-Report($Res) {
     }
 
     W '<section id="system"><h2>System</h2><div class="grid"><div>'
-    $pending = $(if (jb $C 'PendingReboot.Any') { @(ja $C 'PendingReboot.Reasons') -join ', ' } else { 'No' })
+    $pending = $(if (jb $C 'PendingReboot.Any') { @(jae $C 'PendingReboot.Reasons') -join ', ' } else { 'No' })
     $verText = js $C 'System.DisplayVersion'; if (-not $verText) { $verText = js $C 'System.ReleaseId' }
     $collector = (js $C 'Meta.CollectorVersion') + ' as ' + (js $C 'Meta.RunAsUser') + $(if (jb $C 'Meta.RunAsAdmin') { ' (elevated)' } else { ' (NOT elevated)' })
     Write-KV @(
